@@ -1,0 +1,4770 @@
+const express = require('express');
+const router = express.Router();
+const Message = require('../models/Message');
+const Contact = require('../models/Contact');
+const Tenant = require('../models/Tenant');
+const redisService = require('../services/redisService');
+const BotConfiguration = require('../models/WelcomeTemplates');
+const InventoryItem = require('../models/inventory');
+const crypto = require('crypto');
+const { downloadMediaFromWhatsApp } = require('../utils/mediaUtils');
+const WhatsAppService = require('../services/whatsappServices');
+const ShippingCalculation = require('../models/ShippingCalculation');
+const ShippingMethod = require('../models/ShippingMethod');
+const BotStatus = require('../models/BotStatus');
+const { findRelevantResponse: getBotResponse } = require('../services/botService');
+const Order = require('../models/Order');
+const OrderCounter = require('../models/OrderCounter');
+const { generateOrderId } = require('../utils/orderUtils');
+const mongoose = require('mongoose');
+const { findRelevantResponse } = require('../services/botService');
+const mediaTypes = ['image', 'video', 'audio', 'document'];
+const stripeService = require('../services/stripeService');
+const abandonedCartService = require('../services/abandonedCartService');
+const FlowToken = require('../models/FlowToken');
+const Settings = require('../models/settings');
+const Integration = require('../models/Integration');
+const QRCode = require('qrcode');
+const EventTicket = require('../models/EventTicket');
+const RegistrationConfig = require('../models/RegistrationConfig');
+const {
+  handleHistoryWebhook,
+  handleContactsSyncWebhook,
+  handleMessageEchoesWebhook,
+  handleAccountUpdateWebhook
+} = require('./wabaWebhooks');
+const {
+  handleOrderDispatched,
+  handleOrderConfirmation,
+  handleAbandonedCart
+} = require('../services/integrationService');
+
+
+// Rate limiting for bot responses
+const botRateLimit = new Map();
+const processingTickets = new Map();
+const processingOrders = new Map();
+
+function checkBotRateLimit(tenantId, phoneNumber) {
+  const key = `${tenantId}_${phoneNumber}`;
+  const now = Date.now();
+  const windowMs = 60 * 1000; // 1 minute
+  const maxRequests = 8; // INCREASED from 3 to 8 requests per minute
+
+  if (!botRateLimit.has(key)) {
+    botRateLimit.set(key, { count: 1, resetTime: now + windowMs });
+    return true;
+  }
+
+  const data = botRateLimit.get(key);
+  if (now > data.resetTime) {
+    botRateLimit.set(key, { count: 1, resetTime: now + windowMs });
+    return true;
+  }
+
+  if (data.count >= maxRequests) {
+    return false;
+  }
+
+  data.count++;
+  return true;
+}
+
+router.get('/', async (req, res) => {
+  console.log('Webhook Verification Request:', {
+    mode: req.query['hub.mode'],
+    token: req.query['hub.verify_token'],
+    challenge: req.query['hub.challenge']
+  });
+
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+
+  const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
+
+  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+    console.log('Webhook Verified Successfully');
+    res.status(200).send(challenge);
+  } else {
+    console.error('Webhook Verification Failed');
+    console.error('Received Token:', token);
+    console.error('Expected Token:', VERIFY_TOKEN);
+    res.sendStatus(403);
+  }
+});
+
+// Helper function to ensure bot status exists
+async function ensureBotStatus(tenantId) {
+  try {
+    let botStatus = await BotStatus.findOne({ tenantId: tenantId });
+    if (!botStatus) {
+      botStatus = new BotStatus({
+        tenantId: tenantId,
+        status: 'offline' // Default to offline
+      });
+      await botStatus.save();
+      console.log('Created bot status for tenant:', tenantId);
+    }
+    return botStatus;
+  } catch (error) {
+    console.error('Error ensuring bot status:', error);
+    return null;
+  }
+}
+
+// Helper function to update flow usage statistics
+const updateFlowUsageStats = async (tenantId, flowType) => {
+  try {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const FlowUsageStats = require('../models/FlowUsageStats');
+
+    await FlowUsageStats.findOneAndUpdate(
+      {
+        tenantId: tenantId,
+        date: today,
+        flowType: flowType
+      },
+      {
+        $inc: { count: 1 },
+        $set: { lastUsed: new Date() }
+      },
+      { upsert: true }
+    );
+
+    console.log(`Updated flow usage stats for tenant ${tenantId}, type: ${flowType}`);
+  } catch (error) {
+    console.error('Error updating flow usage stats:', error);
+  }
+};
+
+// Middleware to attach tenant
+const attachTenant = async (req, res, next) => {
+  try {
+    let tenant = null;
+    const requestLog = {
+      hasF3Data: !!(req.body?.tenantId && req.body?.source),
+      hasWhatsAppData: !!req.body?.entry?.[0]?.id,
+      webhookField: req.body?.entry?.[0]?.changes?.[0]?.field, // Add this for WABA webhooks
+      f3TenantId: req.body?.tenantId,
+      f3Source: req.body?.source,
+      businessAccountId: req.body?.entry?.[0]?.id
+    };
+
+    console.log('Tenant Resolution - Request Analysis:', requestLog);
+
+    // Priority 1: Check for F3 integration data (WooCommerce, etc.)
+    if (req.body?.tenantId && (req.body?.source === 'woocommerce_f3' || req.body?.source === 'f3_tracking')) {
+      console.log(`F3 Message - Looking for tenant: ${req.body.tenantId}`);
+
+      try {
+        tenant = await Tenant.findById(req.body.tenantId);
+        if (tenant) {
+          console.log(`Found F3 tenant: ${tenant.name || 'Unnamed'} (${tenant._id})`);
+          req.tenant = tenant;
+          req.tenantSource = 'f3_direct';
+          return next();
+        } else {
+          console.warn(`F3 tenant not found: ${req.body.tenantId}`);
+        }
+      } catch (err) {
+        console.warn(`Invalid F3 tenant ID format: ${req.body.tenantId} - ${err.message}`);
+      }
+    }
+
+    // Priority 2: Check for WhatsApp Business Account ID (regular webhooks + WABA webhooks)
+    const businessAccountId = req.body?.entry?.[0]?.id;
+    if (businessAccountId) {
+      console.log(`WhatsApp Message - Looking for business account: ${businessAccountId}`);
+
+      tenant = await Tenant.findOne({
+        'whatsappConfig.businessAccountId': businessAccountId
+      });
+
+      if (tenant) {
+        console.log(`Found WhatsApp tenant: ${tenant.name || 'Unnamed'} (${tenant._id})`);
+        console.log(`Webhook field: ${requestLog.webhookField || 'messages'}`);
+        console.log(`Is WABA webhook: ${['history', 'smb_app_state_sync', 'smb_message_echoes', 'account_update'].includes(requestLog.webhookField)}`);
+
+        req.tenant = tenant;
+        req.tenantSource = 'whatsapp_business_account';
+        return next();
+      } else {
+        console.warn(`No tenant found for business account: ${businessAccountId}`);
+      }
+    }
+
+    // Priority 3: Alternative F3 tenant lookup
+    if (req.body?.tenantId && req.body?.source) {
+      console.log(`Trying alternative F3 tenant lookup: ${req.body.tenantId}`);
+
+      tenant = await Tenant.findOne({
+        $or: [
+          { _id: req.body.tenantId },
+          { tenantId: req.body.tenantId },
+          { 'whatsappConfig.goWhatsTenantId': req.body.tenantId }
+        ]
+      });
+
+      if (tenant) {
+        console.log(`Found tenant via alternative lookup: ${tenant.name || 'Unnamed'} (${tenant._id})`);
+        req.tenant = tenant;
+        req.tenantSource = 'f3_alternative';
+        return next();
+      }
+    }
+
+    // No tenant found
+    console.error('No tenant found for request');
+    return res.status(404).json({
+      error: 'Tenant not found',
+      debug: process.env.NODE_ENV === 'development' ? requestLog : undefined
+    });
+
+  } catch (error) {
+    console.error('Tenant middleware error:', error);
+    return res.status(500).json({ error: 'Tenant resolution failed' });
+  }
+};
+
+router.post('/shopify/:integrationId', async (req, res) => {
+  try {
+    const integrationId = req.params.integrationId;
+
+    // Find the integration
+    const integration = await Integration.findById(integrationId);
+    if (!integration) {
+      console.error(`Integration not found: ${integrationId}`);
+      return res.status(404).json({ error: 'Integration not found' });
+    }
+
+    // Get webhook topic and hmac
+    const topic = req.headers['x-shopify-topic'] || 'unknown';
+    const hmac = req.headers['x-shopify-hmac-sha256'];
+    const shopifyDomain = req.headers['x-shopify-shop-domain'];
+
+    // Get the tenant associated with this integration
+    const tenant = await Tenant.findById(integration.tenantId);
+    if (!tenant) {
+      console.error(`Tenant not found for integration: ${integrationId}`);
+      return res.status(404).json({ error: 'Tenant not found' });
+    }
+
+    // Process based on webhook topic
+    switch(topic) {
+      case 'orders/create':
+      case 'orders/updated':
+        // Handle initial order confirmation
+        await integrationService.handleOrderConfirmation(req.body, tenant, 'shopify');
+        break;
+
+ // ✅ NEW: Handle Order Fulfillment/Dispatch Webhook
+        case 'fulfillments/create':
+          console.log(`Handling Shopify fulfillment/create for order ${req.body.order_id}`);
+          if (integration.isDispatchedMessageEnabled) {
+            // ✅ CHANGE FROM: await integrationService.handleOrderDispatched(...)
+            // TO:
+            await handleOrderDispatched(req.body, tenant, integration, 'shopify');
+          }
+          break;
+
+        case 'orders/create':
+        case 'orders/updated':
+          // ✅ CHANGE FROM: await integrationService.handleOrderConfirmation(...)
+          // TO:
+          await handleOrderConfirmation(req.body, tenant, 'shopify');
+          break;
+
+        case 'carts/create':
+        case 'carts/update':
+          // ✅ CHANGE FROM: await integrationService.handleAbandonedCart(...)
+          // TO:
+          await handleAbandonedCart(req.body, tenant, 'shopify');
+          break;
+      default:
+        console.log(`Unhandled Shopify webhook topic: ${topic}`);
+    }
+
+    // Always acknowledge receipt
+    return res.status(200).json({
+      success: true,
+      message: 'Webhook processed successfully'
+    });
+  } catch (error) {
+    console.error('Shopify webhook processing error:', error);
+    // Still return 200 to avoid retries
+    return res.status(200).json({
+      success: false,
+      message: 'Webhook received with errors',
+      error: error.message
+    });
+  }
+});
+
+
+router.post('/razorpay/partner', async (req, res) => {
+  try {
+    console.log('🤝 Razorpay Partner Webhook Received:', {
+      event: req.body?.event,
+      timestamp: new Date().toISOString()
+    });
+
+    // Verify signature
+    const crypto = require('crypto');
+    const secret = process.env.RAZORPAY_PARTNER_WEBHOOK_SECRET; // Different secret for partner
+
+    const body = JSON.stringify(req.body);
+    const signature = req.headers['x-razorpay-signature'];
+
+    const expectedSignature = crypto
+      .createHmac('sha256', secret)
+      .update(body)
+      .digest('hex');
+
+    if (signature !== expectedSignature) {
+      console.error('❌ Invalid partner webhook signature');
+      return res.status(403).json({ error: 'Invalid signature' });
+    }
+
+    const event = req.body.event;
+    const payload = req.body.payload;
+
+    // Handle different partner events
+    switch (event) {
+      case 'account.activated':
+        console.log('✅ Merchant account activated:', payload.account.id);
+        // Update merchant status in your database
+        break;
+
+      case 'account.updated':
+        console.log('📝 Merchant account updated:', payload.account.id);
+        break;
+
+      case 'application.authorized':
+        console.log('🔓 Application authorized for:', payload.account.id);
+        // This is when a merchant authorizes your app
+        // Store the account_id and other details
+        break;
+
+      case 'application.deauthorized':
+        console.log('🔒 Application deauthorized for:', payload.account.id);
+        // Remove access for this merchant
+        break;
+
+      default:
+        console.log(`ℹ️ Unhandled partner event: ${event}`);
+    }
+
+    // Always return 200
+    return res.status(200).json({ received: true });
+
+  } catch (error) {
+    console.error('❌ Partner webhook error:', error);
+    return res.status(200).json({ received: true }); // Still return 200
+  }
+});
+
+
+// Unified bot decision logic
+const shouldSendBotResponse = async (messageData, tenant, contact, isNewContact) => {
+  try {
+    // First, ensure we are only handling text messages for bot logic.
+    if (messageData.type !== 'text' || !messageData.text?.body) {
+      return { shouldRespond: false, responseType: null };
+    }
+
+    const messageText = messageData.text.body.trim().toLowerCase();
+
+    // Get the current status of the AI chatbot and the Welcome Message system.
+    const [botStatus, botConfig] = await Promise.all([
+      BotStatus.findOne({ tenantId: tenant._id.toString() }),
+      BotConfiguration.findOne({ tenant_id: tenant._id.toString() })
+    ]);
+
+    // Determine if each system is active.
+    const isChatbotActive = botStatus?.status === 'online';
+    const isWelcomeActive = botConfig?.isActive === true;
+
+    console.log('Bot Decision Check:', {
+      phoneNumber: messageData.from,
+      isChatbotActive,
+      isWelcomeActive,
+      isNewContact,
+      messageText: messageText.substring(0, 50),
+      contactBotMode: contact?.botMode
+    });
+
+    // PRIORITY 1: Always allow users to request a human agent
+    const humanAgentKeywords = [
+      'human agent', 'talk to human', 'customer service',
+      'representative', 'agent', 'talk with our team'
+    ];
+    if (humanAgentKeywords.some(keyword => messageText.includes(keyword))) {
+      console.log('Human agent requested');
+      return { shouldRespond: true, responseType: 'human_agent' };
+    }
+
+    // PRIORITY 2: If the AI Chatbot system is turned off, it should never respond.
+    if (!isChatbotActive) {
+      console.log('AI Chatbot system is OFF. No response will be sent.');
+
+      // But still check for welcome message
+      if (isWelcomeActive) {
+        const triggerWords = botConfig.triggerWords || [];
+        const isTriggerWord = triggerWords.some(word => messageText.includes(word.toLowerCase()));
+
+        // Check if a welcome message was sent in the last 3 minutes
+        const recentWelcome = await Message.findOne({
+          tenantId: tenant._id,
+          to: messageData.from,
+          isWelcomeMessage: true,
+          createdAt: { $gte: new Date(Date.now() - 3 * 60 * 1000) }
+        });
+
+        if ((isTriggerWord || isNewContact) && !recentWelcome) {
+          console.log('AI is off but sending welcome message for trigger/new contact');
+          return { shouldRespond: true, responseType: 'welcome' };
+        }
+      }
+
+      return { shouldRespond: false, responseType: null };
+    }
+
+    // Check if chatbot has knowledge base
+    const KnowledgeBase = require('../models/KnowledgeBase');
+    const hasKnowledgeBase = await KnowledgeBase.findOne({
+      tenantId: tenant._id.toString(),
+      hasKnowledgeBase: true
+    });
+
+    if (!hasKnowledgeBase) {
+      console.log('AI Chatbot is ON but has no Knowledge Base.');
+
+      // Still check for welcome message
+      if (isWelcomeActive) {
+        const triggerWords = botConfig.triggerWords || [];
+        const isTriggerWord = triggerWords.some(word => messageText.includes(word.toLowerCase()));
+
+        const recentWelcome = await Message.findOne({
+          tenantId: tenant._id,
+          to: messageData.from,
+          isWelcomeMessage: true,
+          createdAt: { $gte: new Date(Date.now() - 3 * 60 * 1000) }
+        });
+
+        if ((isTriggerWord || isNewContact) && !recentWelcome) {
+          return { shouldRespond: true, responseType: 'welcome' };
+        }
+      }
+
+      return { shouldRespond: false, responseType: null };
+    }
+
+    // CRITICAL FIX: If user is in bot mode, AI should ALWAYS respond
+    if (contact?.botMode === true) {
+      console.log('User is in bot mode. AI will respond directly.');
+      return { shouldRespond: true, responseType: 'ai_response' };
+    }
+
+    // Handle welcome message logic
+    if (isWelcomeActive) {
+      const triggerWords = botConfig.triggerWords || [];
+      const isTriggerWord = triggerWords.some(word => messageText.includes(word.toLowerCase()));
+
+      const recentWelcome = await Message.findOne({
+        tenantId: tenant._id,
+        to: messageData.from,
+        isWelcomeMessage: true,
+        createdAt: { $gte: new Date(Date.now() - 3 * 60 * 1000) }
+      });
+
+      if ((isTriggerWord || isNewContact) && !recentWelcome) {
+        console.log('New contact or trigger word detected. Sending welcome message.');
+        return { shouldRespond: true, responseType: 'welcome' };
+      }
+    }
+
+    // CRITICAL FIX: If welcome is OFF but AI is ON, respond to ALL messages
+    if (isChatbotActive && !isWelcomeActive) {
+      console.log('Welcome system is off, Chatbot is on. Responding with AI.');
+      return { shouldRespond: true, responseType: 'ai_response' };
+    }
+
+    // Default: No response
+    console.log('No specific rule met. No automated response will be sent.');
+    return { shouldRespond: false, responseType: null };
+
+  } catch (error) {
+    console.error('Error in shouldSendBotResponse function:', error);
+    return { shouldRespond: false, responseType: null };
+  }
+};
+
+// Enhanced welcome message sender
+const sendWelcomeMessage = async (phoneNumber, tenant, metadata) => {
+  try {
+    console.log('WELCOME MESSAGE: Starting process for:', {
+      phone: phoneNumber,
+      tenantId: tenant._id
+    });
+
+    const welcomeConfig = await BotConfiguration.findOne({
+      tenant_id: tenant._id.toString(),
+      isActive: true
+    });
+
+    if (!welcomeConfig) {
+      console.error('WELCOME MESSAGE: No active bot configuration found');
+      return;
+    }
+
+    if (!tenant.whatsappConfig?.accessToken) {
+      console.error('WELCOME MESSAGE: Missing WhatsApp access token');
+      return;
+    }
+
+    console.log('WELCOME MESSAGE: Configuration and token validated');
+
+    const whatsappService = new WhatsAppService(tenant);
+
+    try {
+      console.log('WELCOME MESSAGE: Sending via WhatsApp service...');
+
+      const response = await whatsappService.sendWelcomeMessage(phoneNumber, tenant._id.toString());
+
+      if (response) {
+        console.log('WELCOME MESSAGE: Successfully sent!', {
+          messageId: response.messages?.[0]?.id,
+          recipient: phoneNumber
+        });
+
+        const welcomeMessage = new Message({
+          tenantId: tenant._id,
+          from: metadata.phone_number_id,
+          to: phoneNumber,
+          text: welcomeConfig.messageBody,
+          timestamp: new Date(),
+          sent: true,
+          messageId: response.messages?.[0]?.id,
+          status: 'sent',
+          type: 'interactive',
+          isWelcomeMessage: true,
+          isAutomatedMessage: true,
+          excludeFromWindow: true
+        });
+
+        await welcomeMessage.save();
+        console.log('WELCOME MESSAGE: Saved to database:', welcomeMessage._id);
+
+        // Update contact to show welcome message was sent
+        await Contact.findOneAndUpdate(
+          {
+            tenantId: tenant._id.toString(),
+            phone_number: phoneNumber
+          },
+          {
+            $set: {
+              lastWelcomeMessageSent: new Date(),
+              lastMessage: 'Welcome message with options'
+            }
+          }
+        );
+
+        // Emit to socket for real-time UI update
+        if (global.io) {
+          global.io.to(tenant._id.toString()).emit('message_sent', {
+            ...welcomeMessage.toObject(),
+            contact: { phone_number: phoneNumber }
+          });
+
+          console.log('WELCOME MESSAGE: Emitted to socket room');
+        }
+      } else {
+        console.log('WELCOME MESSAGE: No response from WhatsApp service');
+      }
+    } catch (welcomeError) {
+      console.error('WELCOME MESSAGE: Send error:', {
+        error: welcomeError.message,
+        response: welcomeError.response?.data
+      });
+    }
+
+  } catch (error) {
+    console.error('WELCOME MESSAGE: General error:', error);
+  }
+};
+
+// Enhanced AI response handler - CORRECTED VERSION
+async function handleBotResponse(messageData, tenant, metadata) {
+  try {
+    console.log('BOT: Generating AI response for:', {
+      from: messageData.from,
+      message: messageData.text?.body?.substring(0, 50),
+      tenantId: tenant._id
+    });
+
+    const userMessage = messageData.text.body.trim();
+
+    // Rate limiting check with better limits
+    if (!checkBotRateLimit(tenant._id.toString(), messageData.from)) {
+      console.log('BOT: Rate limit exceeded');
+      const whatsappService = new WhatsAppService(tenant);
+
+      const rateLimitResponse = await whatsappService.sendMessage(
+        messageData.from,
+        "I'm responding to many messages right now. Please wait a moment before asking again."
+      );
+
+      if (rateLimitResponse) {
+        // Save rate limit message
+        const rateLimitMessage = new Message({
+          tenantId: tenant._id,
+          from: metadata?.phone_number_id || tenant.whatsappConfig?.phoneNumberId || 'bot',
+          to: messageData.from,
+          text: "I'm responding to many messages right now. Please wait a moment before asking again.",
+          type: 'text',
+          timestamp: new Date(),
+          messageId: rateLimitResponse.messages?.[0]?.id,
+          status: 'sent',
+          isBotMessage: true,
+          isAutomatedMessage: true,
+          isRateLimit: true
+        });
+
+        await rateLimitMessage.save();
+
+        // Emit to UI
+        if (global.io) {
+          global.io.to(tenant._id.toString()).emit('message_sent', {
+            ...rateLimitMessage.toObject(),
+            contact: { phone_number: messageData.from }
+          });
+        }
+      }
+      return;
+    }
+
+    // CORRECTED: Use the proper bot service function
+    const { findRelevantResponse } = require('../services/botService');
+
+    let botResponse;
+    try {
+      console.log('BOT: Calling findRelevantResponse from botService...');
+      botResponse = await findRelevantResponse(userMessage, tenant._id.toString(), messageData.from);
+    } catch (aiError) {
+      console.log('BOT: AI response error - using fallback:', aiError.message);
+      botResponse = "Let me help you with that. Could you please be more specific about what you're looking for?";
+    }
+
+    if (botResponse && botResponse.trim()) {
+      const whatsappService = new WhatsAppService(tenant);
+
+      console.log('BOT: Sending AI response:', botResponse.substring(0, 100) + '...');
+
+      const response = await whatsappService.sendMessage(
+        messageData.from,
+        botResponse
+      );
+
+      if (response) {
+        const botMessage = new Message({
+          tenantId: tenant._id,
+          from: metadata?.phone_number_id || tenant.whatsappConfig?.phoneNumberId || 'bot',
+          to: messageData.from,
+          text: botResponse,
+          type: 'text',
+          timestamp: new Date(),
+          messageId: response.messages?.[0]?.id,
+          status: 'sent',
+          isBotMessage: true,
+          isAutomatedMessage: true
+        });
+
+        await botMessage.save();
+
+        // CRITICAL: Maintain bot conversation state
+        await Contact.findOneAndUpdate(
+          {
+            tenantId: tenant._id.toString(),
+            phone_number: messageData.from
+          },
+          {
+            $set: {
+              lastMessage: botResponse.substring(0, 50) + (botResponse.length > 50 ? '...' : ''),
+              timestamp: new Date(),
+              botMode: true, // KEEP user in bot mode
+              lastBotInteraction: new Date()
+            }
+          }
+        );
+
+        // Emit to UI
+        if (global.io) {
+          global.io.to(tenant._id.toString()).emit('message_sent', {
+            ...botMessage.toObject(),
+            contact: { phone_number: messageData.from }
+          });
+
+          console.log('BOT: AI response emitted to UI');
+        }
+
+        console.log('BOT: AI response sent successfully');
+      }
+    } else {
+      console.log('BOT: No AI response generated - sending fallback');
+
+      const whatsappService = new WhatsAppService(tenant);
+      const fallbackMessage = "I can help you with information about our products. Please ask about specific products or type 'human agent' to speak with our team.";
+
+      const fallbackResponse = await whatsappService.sendMessage(messageData.from, fallbackMessage);
+
+      if (fallbackResponse) {
+        const fallbackMsg = new Message({
+          tenantId: tenant._id,
+          from: metadata?.phone_number_id || tenant.whatsappConfig?.phoneNumberId || 'bot',
+          to: messageData.from,
+          text: fallbackMessage,
+          type: 'text',
+          timestamp: new Date(),
+          messageId: fallbackResponse.messages?.[0]?.id,
+          status: 'sent',
+          isBotMessage: true,
+          isAutomatedMessage: true,
+          isFallback: true
+        });
+
+        await fallbackMsg.save();
+
+        // Emit to UI
+        if (global.io) {
+          global.io.to(tenant._id.toString()).emit('message_sent', {
+            ...fallbackMsg.toObject(),
+            contact: { phone_number: messageData.from }
+          });
+        }
+      }
+    }
+
+  } catch (error) {
+    console.error('BOT: Error in AI response generation:', error);
+
+    try {
+      const whatsappService = new WhatsAppService(tenant);
+      const errorMessage = "I'm experiencing technical difficulties. Type 'human agent' for immediate assistance.";
+
+      const errorResponse = await whatsappService.sendMessage(messageData.from, errorMessage);
+
+      if (errorResponse) {
+        const errorMsg = new Message({
+          tenantId: tenant._id,
+          from: metadata?.phone_number_id || tenant.whatsappConfig?.phoneNumberId || 'bot',
+          to: messageData.from,
+          text: errorMessage,
+          type: 'text',
+          timestamp: new Date(),
+          messageId: errorResponse.messages?.[0]?.id,
+          status: 'sent',
+          isBotMessage: true,
+          isAutomatedMessage: true,
+          isError: true
+        });
+
+        await errorMsg.save();
+
+        // Emit to UI
+        if (global.io) {
+          global.io.to(tenant._id.toString()).emit('message_sent', {
+            ...errorMsg.toObject(),
+            contact: { phone_number: messageData.from }
+          });
+        }
+      }
+    } catch (fallbackError) {
+      console.error('BOT: Failed to send error fallback message:', fallbackError);
+    }
+  }
+}
+
+router.post('/stripe', async (req, res) => {
+  try {
+    const signature = req.headers['stripe-signature'];
+
+    console.log('🔔 ====== STRIPE WEBHOOK RECEIVED ======');
+    console.log('📊 Timestamp:', new Date().toISOString());
+
+    // ✅ DEBUG: Check what we received
+    console.log('🔍 Request Body Type:', {
+      typeOf: typeof req.body,
+      isBuffer: Buffer.isBuffer(req.body),
+      bodyConstructor: req.body?.constructor?.name,
+      hasRawBody: !!req.rawBody,
+      rawBodyType: req.rawBody ? typeof req.rawBody : 'none'
+    });
+
+    // ✅ CRITICAL: Use rawBody for signature verification
+    let event;
+    try {
+      // Use req.rawBody if available (most reliable), otherwise req.body
+      const payload = req.rawBody || req.body;
+
+      if (!Buffer.isBuffer(payload)) {
+        console.error('❌ Payload is not a Buffer:', typeof payload);
+        console.error('This will cause signature verification to fail!');
+        // Try to convert if it's a string
+        const bufferPayload = typeof payload === 'string' ? Buffer.from(payload) : payload;
+        event = stripeService.verifyWebhookSignature(bufferPayload, signature);
+      } else {
+        event = stripeService.verifyWebhookSignature(payload, signature);
+      }
+
+    } catch (err) {
+      console.error('❌ Webhook signature verification failed:', err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    console.log('✅ Webhook Verified:', event.type);
+    console.log('📋 Event ID:', event.id);
+
+    // Handle different event types
+    switch (event.type) {
+      case 'checkout.session.completed':
+        console.log('💳 Processing checkout.session.completed...');
+        await handleStripeCheckoutCompleted(event.data.object);
+        break;
+
+      case 'payment_intent.succeeded':
+        console.log('💰 Processing payment_intent.succeeded...');
+        await handleStripePaymentSucceeded(event.data.object);
+        break;
+
+      case 'payment_intent.payment_failed':
+        console.log('❌ Processing payment_intent.payment_failed...');
+        await handleStripePaymentFailed(event.data.object);
+        break;
+
+      case 'charge.refunded':
+        console.log('💸 Processing charge.refunded...');
+        await handleStripeRefund(event.data.object);
+        break;
+
+      default:
+        console.log(`ℹ️ Unhandled Stripe event type: ${event.type}`);
+    }
+
+    // ✅ ALWAYS return 200 to acknowledge receipt
+    res.json({ received: true });
+
+  } catch (error) {
+    console.error('❌ Stripe Webhook Error:', {
+      message: error.message,
+      stack: error.stack?.split('\n').slice(0, 3).join('\n')
+    });
+
+    // Still return 200 to prevent Stripe retries for unrecoverable errors
+    res.status(200).json({
+      received: true,
+      error: 'Webhook processing failed but acknowledged'
+    });
+  }
+});
+
+async function sendStaticTicketImage(tenant, phoneNumber, customerName, orderId, participantCount) {
+  try {
+    console.log('🎟️ ====== SENDING STATIC TICKET IMAGE ======');
+    console.log(`📱 To: ${phoneNumber}, Order: ${orderId}, Pax: ${participantCount}`);
+
+    const fs = require('fs');
+    const path = require('path');
+    const whatsappService = new WhatsAppService(tenant);
+
+    // ✅ Path where you upload the ticket image on the server
+    // Run: scp ticket.png ec2-user@server:/var/www/gowhats/server/uploads/tickets/digital_sakthi_ticket.png
+    const ticketImagePath = path.join(
+    __dirname, '..', 'uploads', 'digitalsakthievent.png'
+    );
+
+    if (!fs.existsSync(ticketImagePath)) {
+      console.error('❌ Ticket image not found at:', ticketImagePath);
+      // Fallback to plain text confirmation
+      await whatsappService.sendMessage(
+        phoneNumber,
+        `🎉 *Payment Confirmed!*\n\n` +
+        `Hi *${customerName}*! Your ticket for *Digital Sakthi* is confirmed.\n\n` +
+        `📄 *Booking ID:* ${orderId}\n` +
+        `👥 *Participants:* ${participantCount}\n` +
+        `📅 *Date:* 22 February 2026\n` +
+        `🕒 *Doors Open:* 3:00 PM\n` +
+        `📍 *Venue:* De Villa, 320 Serangoon Rd, #02-14 Centrium Square, Singapore 218108\n\n` +
+        `Please show this message at the entrance.\n\n_Powered by GoWhats!_`
+      );
+      return false;
+    }
+
+    // Upload static ticket image to WhatsApp
+    console.log('📤 Uploading static ticket image to WhatsApp...');
+    const uploadResult = await whatsappService.uploadMediaFile(
+      {
+        path: ticketImagePath,
+        mimetype: 'image/png',
+        originalname: 'digital_sakthi_ticket.png'
+      },
+      'image'
+    );
+
+    console.log('✅ Ticket image uploaded. Media ID:', uploadResult.id);
+
+    // Caption sent with the image
+    const caption =
+      `🎉 *Payment Confirmed! Welcome to Digital Sakthi!*\n\n` +
+      `Hi *${customerName}*! Your payment of *SGD 15* has been received.\n\n` +
+      `📄 *Booking ID:* ${orderId}\n` +
+      `👥 *Participants:* ${participantCount}\n` +
+      `📅 *Date:* 22 February 2026\n` +
+      `🕒 *Doors Open:* 3:00 PM\n` +
+      `📍 *Venue:* De Villa, 320 Serangoon Rd, #02-14 Centrium Square, Singapore 218108\n\n` +
+      `Please show this ticket image at the entrance.\n\n_Powered by GoWhats!_`;
+
+    // Send the image
+    await whatsappService.sendMediaMessage(
+      phoneNumber,
+      'image',
+      { id: uploadResult.id },
+      caption
+    );
+
+    console.log('✅ Static ticket image sent to:', phoneNumber);
+    return true;
+
+  } catch (error) {
+    console.error('❌ Error sending static ticket image:', error.message);
+
+    // Last-resort text fallback
+    try {
+      const ws = new WhatsAppService(tenant);
+      await ws.sendMessage(
+        phoneNumber,
+        `🎉 Payment confirmed! Hi ${customerName}, your Digital Sakthi ticket (Booking: ${orderId}) is ready.\n` +
+        `📅 22 Feb 2026 | 🕒 3:00 PM | 📍 De Villa, 320 Serangoon Rd, Singapore 218108`
+      );
+    } catch (e) {
+      console.error('❌ Even text fallback failed:', e.message);
+    }
+    return false;
+  }
+}
+
+
+/**
+ * Handle successful checkout session
+ */
+async function handleStripeCheckoutCompleted(session) {
+  try {
+    console.log('💳 ====== PROCESSING CHECKOUT COMPLETION ======');
+    console.log('Session ID:', session.id);
+    console.log('Payment Status:', session.payment_status);
+    console.log('Amount Total:', session.amount_total / 100);
+
+    const sessionCurrency = session.currency?.toUpperCase() || 'SGD';
+
+    const orderId = session.metadata.orderId;
+    const tenantId = session.metadata.tenantId;
+    const registrationConfigId = session.metadata.registrationConfigId;
+
+    console.log('📋 Metadata:', { orderId, tenantId, registrationConfigId, currency: sessionCurrency });
+
+    const Order = require('../models/Order');
+    const order = await Order.findOne({ tenantId: tenantId, orderId: orderId });
+
+    if (!order) {
+      console.error('❌ Order not found:', orderId);
+      return;
+    }
+
+    // ✅ Duplicate webhook guard
+    if (order.paymentStatus === 'completed' && order.metadata?.ticketSent) {
+      console.log('⚠️ Already processed, skipping:', orderId);
+      return;
+    }
+
+    // Update order
+    order.paymentStatus = 'completed';
+    order.status = 'confirmed';
+    order.confirmedAt = new Date();
+    order.paymentDetails = {
+      ...order.paymentDetails,
+      gateway: 'stripe',
+      status: 'completed',
+      sessionId: session.id,
+      amount: session.amount_total / 100,
+      currency: sessionCurrency
+    };
+    await order.save();
+    console.log('✅ Order marked completed');
+
+    const Tenant = require('../models/Tenant');
+    const tenant = await Tenant.findById(tenantId);
+    if (!tenant) {
+      console.error('❌ Tenant not found:', tenantId);
+      return;
+    }
+
+    // ✅ Get participant count from multiple sources
+    let participantCount = 1;
+    if (order.participantCount && order.participantCount > 0) {
+      participantCount = order.participantCount;
+    } else if (order.metadata?.participantCount) {
+      participantCount = parseInt(order.metadata.participantCount, 10) || 1;
+    } else if (session.metadata?.participantCount) {
+      participantCount = parseInt(session.metadata.participantCount, 10) || 1;
+    }
+    console.log(`👥 Participant Count: ${participantCount}`);
+
+    const customerName = order.customerDetails?.name || 'Guest';
+    const customerPhone = order.customerPhone;
+
+    // ============================================================
+    // ✅ REGISTRATION ORDER → Send Static Ticket Image
+    // ============================================================
+    if (order.source === 'registration_flow' || order.metadata?.isRegistrationOrder) {
+      console.log('🎟️ Registration order — sending static ticket image...');
+
+      const ticketSent = await sendStaticTicketImage(
+        tenant,
+        customerPhone,
+        customerName,
+        orderId,
+        participantCount
+      );
+
+      // Save result to order
+      if (!order.metadata) order.metadata = {};
+      order.metadata.ticketSent = ticketSent;
+      order.metadata.ticketSentAt = new Date();
+      order.metadata.ticketsGenerated = ticketSent; // legacy flag
+      await order.save();
+
+      // Update EventTicket records if any exist
+      try {
+        const EventTicket = require('../models/EventTicket');
+        await EventTicket.updateMany(
+          { tenantId: tenantId, orderId: orderId },
+          { $set: { status: 'active', paymentConfirmed: true } }
+        );
+      } catch (e) {
+        console.log('EventTicket update skipped:', e.message);
+      }
+
+      // Increment RegistrationConfig payment count
+      try {
+        const RegistrationConfig = require('../models/RegistrationConfig');
+        const regConfig = await RegistrationConfig.findById(registrationConfigId) ||
+                          await RegistrationConfig.findOne({ tenantId: tenantId, isActive: true });
+        if (regConfig) await regConfig.incrementPaymentCount();
+      } catch (e) {
+        console.log('RegConfig count update skipped:', e.message);
+      }
+
+      console.log(`🎟️ Ticket image sent: ${ticketSent ? '✅ SUCCESS' : '⚠️ FAILED (text fallback sen t)'}`);
+
+    } else {
+      // 📦 Normal shop order — existing logic
+      console.log('📦 Standard order - sending confirmation...');
+      await sendOrderConfirmationMessage(order, customerPhone, tenant, session.metadata);
+    }
+
+    // Emit real-time socket update
+    if (global.io) {
+      global.io.to(tenantId).emit('payment_status_update', {
+        orderId: orderId,
+        status: 'completed',
+        gateway: 'stripe',
+        currency: sessionCurrency,
+        tenantId: tenantId,
+        participantCount: participantCount,
+        ticketSent: order.metadata?.ticketSent || false
+      });
+      console.log('📡 Socket event emitted');
+    }
+
+    console.log('✅ ====== CHECKOUT COMPLETION PROCESSED ======\n');
+
+  } catch (error) {
+    console.error('❌ ====== CHECKOUT HANDLER ERROR ======');
+    console.error('Error:', error.message);
+    console.error('Stack:', error.stack?.split('\n').slice(0, 5).join('\n'));
+  }
+}
+
+
+/**
+ * Handle successful payment intent
+ */
+async function handleStripePaymentSucceeded(paymentIntent) {
+  console.log('✅ Stripe Payment Intent Succeeded:', {
+    id: paymentIntent.id,
+    amount: paymentIntent.amount / 100,
+    currency: paymentIntent.currency
+  });
+  // Additional logic if needed
+}
+
+/**
+ * Handle failed payment
+ */
+async function handleStripePaymentFailed(paymentIntent) {
+  console.log('❌ Stripe Payment Failed:', paymentIntent.id);
+
+  const orderId = paymentIntent.metadata?.orderId;
+  if (!orderId) return;
+
+  const Order = require('../models/Order');
+  await Order.findOneAndUpdate(
+    { orderId: orderId },
+    {
+      $set: {
+        paymentStatus: 'failed',
+        'paymentDetails.status': 'failed',
+        'paymentDetails.failureReason': paymentIntent.last_payment_error?.message || 'Unknown error'
+      }
+    }
+  );
+
+  console.log('✅ Order marked as payment failed:', orderId);
+}
+
+/**
+ * Handle refund
+ */
+async function handleStripeRefund(charge) {
+  console.log('💸 Stripe Refund Processed:', {
+    id: charge.id,
+    amount: charge.amount_refunded / 100,
+    currency: charge.currency
+  });
+  // Handle refund logic
+}
+
+
+router.get('/bot-health/:tenantId', async (req, res) => {
+  try {
+    const tenantId = req.params.tenantId;
+
+    const [botStatus, botConfig, knowledgeBase, tenant] = await Promise.all([
+      BotStatus.findOne({ tenantId }),
+      BotConfiguration.findOne({ tenant_id: tenantId }),
+      require('../models/KnowledgeBase').findOne({ tenantId }),
+      require('../models/Tenant').findById(tenantId)
+    ]);
+
+    const health = {
+      tenantId,
+      timestamp: new Date().toISOString(),
+
+      // Separate status for chatbot and welcome message
+      chatbot: {
+        isActive: botStatus?.status === 'online',
+        hasKnowledgeBase: !!(knowledgeBase?.hasKnowledgeBase),
+        chunksCount: knowledgeBase?.chunksCount || 0,
+        embeddingsCount: knowledgeBase?.vectors?.filter(v => v.embedding?.length > 0).length || 0,
+        status: botStatus?.status || 'offline',
+        lastUpdated: botStatus?.lastUpdated
+      },
+
+      welcomeMessage: {
+        isActive: botConfig?.isActive || false,
+        hasConfiguration: !!botConfig,
+        triggerWords: botConfig?.triggerWords?.length || 0,
+        workflows: botConfig?.workflows?.length || 0,
+        messageType: botConfig?.welcomeMessageType || 'none'
+      },
+
+      tenant: {
+        exists: !!tenant,
+        hasWhatsAppConfig: !!(tenant?.whatsappConfig?.accessToken),
+        name: tenant?.name || 'Unknown'
+      }
+    };
+
+    // Determine system behavior
+    health.systemBehavior = {
+      chatbotWillRespond: health.chatbot.isActive && health.chatbot.hasKnowledgeBase,
+      welcomeMessageWillSend: health.welcomeMessage.isActive && health.welcomeMessage.hasConfiguration,
+      currentMode: health.welcomeMessage.isActive ?
+        (health.chatbot.isActive ? 'Both Active (Welcome Priority)' : 'Welcome Message Only') :
+        (health.chatbot.isActive ? 'Chatbot Only' : 'Both Inactive')
+    };
+
+    // Add recommendations
+    health.recommendations = [];
+
+    if (!health.chatbot.isActive && !health.welcomeMessage.isActive) {
+      health.recommendations.push('⚠️ Both chatbot and welcome message are inactive');
+    }
+
+    if (health.chatbot.isActive && !health.chatbot.hasKnowledgeBase) {
+      health.recommendations.push('❌ Chatbot is ON but no knowledge base uploaded');
+    }
+
+    if (health.welcomeMessage.isActive && !health.welcomeMessage.hasConfiguration) {
+      health.recommendations.push('❌ Welcome message is ON but not configured');
+    }
+
+    if (!health.tenant.hasWhatsAppConfig) {
+      health.recommendations.push('❌ WhatsApp configuration missing');
+    }
+
+    if (health.recommendations.length === 0) {
+      health.recommendations.push('✅ System configured correctly');
+    }
+
+    res.json(health);
+
+  } catch (error) {
+    res.status(500).json({
+      error: error.message,
+      tenantId: req.params.tenantId,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// Handle human agent requests
+async function handleHumanAgentRequest(messageData, tenant, metadata) {
+  try {
+    console.log('Human agent requested by:', messageData.from);
+
+    // Update contact to mark human agent request
+    const updatedContact = await Contact.findOneAndUpdate(
+      {
+        tenantId: tenant._id.toString(),
+        phone_number: messageData.from
+      },
+      {
+        $set: {
+          botMode: false,
+          humanAgentRequested: true, // NEW: Mark as human agent requested
+          lastHumanAgentRequest: new Date(),
+          humanAgentStatus: 'requested', // NEW: Set status
+          lastMessage: 'Requested human agent'
+        }
+      },
+      { upsert: true, new: true }
+    );
+
+    const whatsappService = new WhatsAppService(tenant);
+
+    // Get custom message from bot config if available
+    const botConfig = await BotConfiguration.findOne({
+      tenant_id: tenant._id.toString()
+    });
+
+    let agentMessage = "🙋‍♀️ Connecting you with our human agent...\n\nOur team will assist you shortly. Thank you for your patience! ❤️";
+
+    // Try to get custom "Talk with Our Team" message
+    if (botConfig?.workflowMessages) {
+      const customMessage = botConfig.workflowMessages.find(
+        wm => wm.workflow === 'Talk with Our Team'
+      );
+      if (customMessage?.message) {
+        agentMessage = customMessage.message;
+      }
+    }
+
+    agentMessage += "\n\nPowered by GoWhats!";
+
+    const response = await whatsappService.sendMessage(messageData.from, agentMessage);
+
+    if (response) {
+      const agentRequestMessage = new Message({
+        tenantId: tenant._id,
+        from: metadata?.phone_number_id || tenant.whatsappConfig?.phoneNumberId || 'system',
+        to: messageData.from,
+        text: agentMessage,
+        type: 'text',
+        timestamp: new Date(),
+        messageId: response.messages?.[0]?.id,
+        status: 'sent',
+        isHumanAgentRequest: true
+      });
+
+      await agentRequestMessage.save();
+
+      if (global.io) {
+        global.io.to(tenant._id.toString()).emit('message_sent', {
+          ...agentRequestMessage.toObject(),
+          contact: { phone_number: messageData.from }
+        });
+
+        // Emit human agent request event with updated contact
+        global.io.to(tenant._id.toString()).emit('human_agent_requested', {
+          phoneNumber: messageData.from,
+          tenantId: tenant._id,
+          requestedAt: new Date(),
+          customerName: messageData.profile?.name || 'Customer',
+          updatedContact: updatedContact
+        });
+
+        // Emit contact update to refresh the UI
+        global.io.to(tenant._id.toString()).emit('contact_updated', {
+          contact: updatedContact,
+          tenantId: tenant._id.toString(),
+          timestamp: new Date(),
+          action: 'human_agent_requested'
+        });
+      }
+    }
+
+    console.log('Human agent request processed successfully');
+
+  } catch (error) {
+    console.error('Error handling human agent request:', error);
+  }
+}
+
+
+// Enhanced broadcast status update function with real-time emission
+async function updateBroadcastStatusWithRealTimeEmit(broadcastId, messageId, messageStatus, recipientPhone, tenantId) {
+  try {
+    const Broadcast = require('../models/Broadcast');
+    const Message = require('../models/Message'); // ✅ Import Message model
+
+    // 1. Find the Broadcast
+    const broadcast = await Broadcast.findById(broadcastId);
+    if (!broadcast) {
+      console.log(`Broadcast not found for ID: ${broadcastId}`);
+      return;
+    }
+
+    // 2. ✅ FIX: Find the local Message document to get the correct ObjectId
+    const messageDoc = await Message.findOne({ messageId: messageId });
+
+    if (!messageDoc) {
+        // Suppress warning to avoid log noise for fast updates
+        return;
+    }
+
+    // Use the MongoDB _id (ObjectId), not the wamid string
+    const dbMessageId = messageDoc._id;
+
+    let statusChanged = false;
+    let countsChanged = false;
+
+    if (!broadcast.sentMessages) broadcast.sentMessages = [];
+    if (!broadcast.deliveredMessages) broadcast.deliveredMessages = [];
+    if (!broadcast.readMessages) broadcast.readMessages = [];
+    if (!broadcast.failedMessages) broadcast.failedMessages = [];
+
+    // Helper to check if ID exists (handling ObjectId comparison safely)
+    const hasId = (array, id) => array.some(existingId => existingId.toString() === id.toString());
+
+    switch (messageStatus) {
+      case 'sent':
+        if (!hasId(broadcast.sentMessages, dbMessageId)) {
+          broadcast.sentMessages.push(dbMessageId);
+          broadcast.sentCount = broadcast.sentMessages.length;
+          countsChanged = true;
+          console.log(`Updated sent count for broadcast ${broadcastId}: ${broadcast.sentCount}`);
+        }
+        break;
+
+      case 'delivered':
+        if (!hasId(broadcast.deliveredMessages, dbMessageId)) {
+          broadcast.deliveredMessages.push(dbMessageId);
+          broadcast.deliveredCount = broadcast.deliveredMessages.length;
+          countsChanged = true;
+          console.log(`Updated delivered count for broadcast ${broadcastId}: ${broadcast.deliveredCount}`);
+        }
+        break;
+
+      case 'read':
+        if (!hasId(broadcast.readMessages, dbMessageId)) {
+          broadcast.readMessages.push(dbMessageId);
+          broadcast.readCount = broadcast.readMessages.length;
+          countsChanged = true;
+          console.log(`Updated read count for broadcast ${broadcastId}: ${broadcast.readCount}`);
+        }
+        break;
+
+      case 'failed':
+        if (!hasId(broadcast.failedMessages, dbMessageId)) {
+          broadcast.failedMessages.push(dbMessageId);
+          broadcast.failedCount = broadcast.failedMessages.length;
+          countsChanged = true;
+          console.log(`Updated failed count for broadcast ${broadcastId}: ${broadcast.failedCount}`);
+        }
+        break;
+    }
+
+    const totalRecipients = broadcast.recipients ? broadcast.recipients.length : 0;
+    const sentCount = broadcast.sentCount || 0;
+    const failedCount = broadcast.failedCount || 0;
+
+    // ✅ FIX: Use lowercase 'completed' to match Mongoose Enum
+    if (sentCount + failedCount >= totalRecipients && broadcast.status !== 'completed') {
+      broadcast.status = 'completed';
+      statusChanged = true;
+    }
+    // ✅ FIX: Use lowercase 'processing' instead of 'In Progress'
+    else if (sentCount > 0 && (broadcast.status === 'pending' || broadcast.status === 'scheduled')) {
+      broadcast.status = 'processing';
+      statusChanged = true;
+    }
+
+    if (statusChanged || countsChanged) {
+      broadcast.lastStatusUpdate = new Date();
+      await broadcast.save();
+
+      const newCounts = {
+        sent: broadcast.sentCount || 0,
+        delivered: broadcast.deliveredCount || 0,
+        read: broadcast.readCount || 0,
+        failed: broadcast.failedCount || 0
+      };
+
+      if (global.io && tenantId) {
+        const updateData = {
+          broadcastId: broadcastId,
+          messageId: messageId,
+          messageStatus: messageStatus,
+          recipientPhone: recipientPhone,
+          broadcast: {
+            id: broadcast._id,
+            name: broadcast.name,
+            status: broadcast.status,
+            sentCount: newCounts.sent,
+            deliveredCount: newCounts.delivered,
+            readCount: newCounts.read,
+            failedCount: newCounts.failed,
+            totalRecipients: totalRecipients,
+            progress: totalRecipients > 0 ? Math.round((newCounts.sent / totalRecipients) * 100) : 0
+          },
+          timestamp: new Date().toISOString(),
+          countsChanged: countsChanged,
+          statusChanged: statusChanged
+        };
+
+        global.io.to(tenantId).emit('broadcast_status_update', updateData);
+        global.io.to(tenantId).emit('broadcast_update', updateData);
+
+        const broadcastRoom = `broadcast_${broadcastId}_${tenantId}`;
+        global.io.to(broadcastRoom).emit('broadcast_detailed_update', updateData);
+
+        // ✅ FIX: Check for lowercase 'completed'
+        if (broadcast.status === 'completed' && statusChanged) {
+          global.io.to(tenantId).emit('broadcast_completed', {
+            broadcastId: broadcast._id,
+            name: broadcast.name,
+            status: 'completed',
+            finalCounts: newCounts,
+            totalRecipients: totalRecipients,
+            completedAt: new Date().toISOString()
+          });
+        }
+      }
+    }
+
+  } catch (error) {
+    console.error('Error updating broadcast status:', {
+      error: error.message,
+      broadcastId,
+      messageId,
+      messageStatus
+    });
+  }
+}
+
+// Handle payment status updates
+// ✅ FIXED: Payment Handler with Proper Participant Count Retrieval
+async function handlePaymentStatusUpdate(paymentStatus, tenant, metadata) {
+  try {
+    const { recipient_id: customerPhone, status, payment } = paymentStatus;
+    const { reference_id: orderId, transaction } = payment;
+
+    console.log('💳 Payment Update:', { orderId, status, tenantId: tenant._id });
+
+    // ✅ CRITICAL: Check if already processing
+    const processingKey = `${tenant._id}-${orderId}`;
+    if (processingOrders.has(processingKey)) {
+      console.log('⚠️ DUPLICATE PAYMENT WEBHOOK IGNORED');
+      return;
+    }
+
+    // ✅ Mark as processing
+    processingOrders.set(processingKey, Date.now());
+
+    // ✅ Auto-cleanup after 5 minutes
+    setTimeout(() => {
+      processingOrders.delete(processingKey);
+    }, 5 * 60 * 1000);
+
+    const order = await Order.findOne({
+        tenantId: tenant._id.toString(),
+        orderId: orderId
+    });
+
+    if (!order) {
+        console.warn(`Order not found for payment: ${orderId}`);
+        processingOrders.delete(processingKey);
+        return;
+    }
+
+    // ✅ CRITICAL: Check if already processed
+    if (order.paymentStatus === 'completed' && order.metadata?.ticketsGenerated) {
+      console.log('✅ SKIP: Tickets already generated for this order');
+      processingOrders.delete(processingKey);
+      return;
+    }
+
+    // Handle Successful Payment
+    if (status === 'captured' && transaction?.status === 'success') {
+      console.log('✅ Payment captured successfully!');
+
+      order.paymentStatus = 'completed';
+      order.status = 'confirmed';
+      order.confirmedAt = new Date();
+
+      if (!order.paymentDetails) order.paymentDetails = {};
+      order.paymentDetails = {
+        ...order.paymentDetails,
+        status: 'completed',
+        transactionId: transaction.id,
+        amount: payment.amount?.value / 100,
+        currency: payment.currency
+      };
+
+      if (!order.metadata) order.metadata = {};
+      order.metadata.ticketsGenerating = true;
+
+      await order.save();
+
+      // ✅ Generate tickets for registration orders
+      if (order.source === 'registration_flow') {
+        console.log('🎟️ Registration Payment Confirmed - Generating Tickets...');
+
+        // ✅ FIX: Get participant count from MULTIPLE sources (top level OR metadata)
+        const participantCount = order.participantCount ||
+                                order.metadata?.participantCount ||
+                                order.metadata?.totalPax ||
+                                1;
+
+        console.log(`👥 Retrieved Participant Count:`, {
+          fromTopLevel: order.participantCount,
+          fromMetadata: order.metadata?.participantCount,
+          fromTotalPax: order.metadata?.totalPax,
+          finalCount: participantCount
+        });
+
+        // ✅ FIX: Get config using saved reference
+        let regConfig;
+
+        if (order.metadata?.registrationConfigId) {
+          regConfig = await RegistrationConfig.findById(order.metadata.registrationConfigId);
+          console.log(`✅ Found config by ID: ${order.metadata.registrationConfigId}`);
+        } else {
+          // Fallback to tenant lookup
+          regConfig = await RegistrationConfig.findOne({
+            tenantId: tenant._id,
+            isActive: true
+          });
+          console.log('⚠️ Using fallback config lookup');
+        }
+
+        if (regConfig) {
+          console.log(`🎫 Generating ${participantCount} ticket(s) for Order: ${order.orderId}`);
+
+          const ticketsGenerated = await generateAndSendMultipleTickets(
+            tenant,
+            customerPhone,
+            participantCount, // ✅ Now using correct count from order metadata
+            regConfig,
+            order.customerDetails.name,
+            order.registrationDetails,
+            order.orderId // ✅ This is already EV101 format
+          );
+
+          if (ticketsGenerated) {
+            order.metadata.ticketsGenerated = true;
+            order.metadata.ticketsGenerating = false;
+            order.metadata.ticketsGeneratedAt = new Date();
+            await order.save();
+            console.log('✅ Tickets marked as generated in order');
+          } else {
+            console.error('❌ Ticket generation failed');
+            order.metadata.ticketsGenerating = false;
+            order.metadata.ticketGenerationFailed = true;
+            await order.save();
+          }
+        } else {
+          console.error('❌ Registration config not found for ticket generation');
+          order.metadata.ticketsGenerating = false;
+          await order.save();
+        }
+      } else {
+        // Standard E-commerce Confirmation
+        await sendOrderConfirmationMessage(order, customerPhone, tenant, metadata);
+      }
+
+      processingOrders.delete(processingKey);
+    }
+    // Handle Failed Payment
+    else if (transaction?.status === 'failed') {
+      order.paymentStatus = 'failed';
+      await order.save();
+      processingOrders.delete(processingKey);
+
+      const whatsappService = new WhatsAppService(tenant);
+      await whatsappService.sendMessage(customerPhone, "❌ Payment failed. Please try again to secure your booking.");
+    } else {
+      processingOrders.delete(processingKey);
+    }
+
+    // Emit socket update
+    if (global.io) {
+      global.io.to(tenant._id.toString()).emit('payment_status_update', {
+        orderId,
+        status: order.paymentStatus,
+        tenantId: tenant._id
+      });
+    }
+
+  } catch (error) {
+    console.error('❌ Payment Handler Error:', error);
+    const processingKey = `${tenant._id}-${payment?.reference_id}`;
+    processingOrders.delete(processingKey);
+  }
+}
+
+
+// Send order confirmation message after successful payment
+async function sendOrderConfirmationMessage(order, customerPhone, tenant, metadata) {
+  try {
+    // 1. Fetch Settings safely
+    const Settings = require('../models/settings');
+    let settings = await Settings.findOne({ tenant_id: tenant._id.toString() });
+
+    // 2. Default config if settings are missing
+    let confirmConfig = settings?.automationConfig?.orderConfirmation;
+
+    // 3. Check if explicitly disabled
+    if (confirmConfig && confirmConfig.enabled === false) {
+       console.log('🔕 Order Confirmation disabled for tenant:', tenant._id);
+       return;
+    }
+
+    console.log('✅ Sending order confirmation for:', order.orderId);
+
+    // 4. Prepare Message (Use fallback if template is missing)
+    let messageBody = confirmConfig?.template?.body;
+
+    if (!messageBody) {
+        messageBody = "✅ Thank you! Your order *{{order_id}}* has been confirmed.\nAmount: {{amount}}";
+    }
+
+    // 5. Replace Variables (Add safety checks)
+    const amountStr = order.totalAmount ? order.totalAmount.toFixed(2) : '0.00';
+    const currency = order.currency || 'INR';
+    const itemsCount = order.items ? order.items.length : 0;
+    const custName = order.customerDetails?.name || 'Customer';
+
+    messageBody = messageBody
+      .replace('{{order_id}}', order.orderId)
+      .replace('{{amount}}', `${currency} ${amountStr}`)
+      .replace('{{items}}', itemsCount)
+      .replace('{{customer}}', custName);
+
+    // Append Footer
+    messageBody += "\n\nPowered by GoWhats!";
+
+    const whatsappService = new WhatsAppService(tenant);
+    const response = await whatsappService.sendMessage(customerPhone, messageBody);
+
+    if (response) {
+      await Message.create({
+        tenantId: tenant._id,
+        from: metadata?.phone_number_id,
+        to: customerPhone,
+        text: messageBody,
+        type: 'text',
+        status: 'sent',
+        messageId: response.messages?.[0]?.id, // Add null check here
+        isOrderConfirmation: true
+      });
+      console.log('✅ Order confirmation sent successfully');
+    }
+
+  } catch (error) {
+    console.error('❌ Error sending confirmation:', error);
+  }
+}
+
+
+async function isTriggerWord(messageText, tenant) {
+  try {
+    if (!messageText || typeof messageText !== 'string') {
+      return false;
+    }
+
+    // Get bot configuration for this tenant
+    const botConfig = await BotConfiguration.findOne({
+      tenant_id: tenant._id.toString(),
+      isActive: true
+    });
+
+    if (!botConfig || !botConfig.triggerWords || !Array.isArray(botConfig.triggerWords)) {
+      return false;
+    }
+
+    const normalizedMessage = messageText.trim().toLowerCase();
+
+    // Check if message contains any trigger words
+    return botConfig.triggerWords.some(word =>
+      normalizedMessage.includes(word.toLowerCase())
+    );
+
+  } catch (error) {
+    console.error('Error checking trigger word:', error);
+    return false;
+  }
+}
+
+// Helper function to process message by type
+async function processMessageByType(messageData, tenant, metadata) {
+  const type = messageData.type;
+  let details = {
+    text: '',
+    lastMessageText: '',
+    mediaUrl: '',
+    s3Key: '',
+    storage: 's3',
+    caption: '',
+    filename: '',
+    isFlowCompletion: false,
+    isInteractiveResponse: false,
+    quotedMessage: null,  // ✅ NEW
+    replyTo: null         // ✅ NEW
+  };
+
+  // ✅ NEW: Check if message is a reply
+  if (messageData.context && messageData.context.id) {
+    console.log('📎 Message is a reply to:', messageData.context.id);
+
+    try {
+      const originalMessage = await Message.findOne({
+        tenantId: tenant._id.toString(),
+        messageId: messageData.context.id
+      });
+
+      if (originalMessage) {
+        console.log('✅ Found original message:', originalMessage._id);
+
+        details.quotedMessage = {
+          messageId: originalMessage.messageId,
+          text: originalMessage.text || '',
+          from: originalMessage.from,
+          timestamp: originalMessage.timestamp,
+          type: originalMessage.type,
+          mediaUrl: originalMessage.mediaUrl,
+          senderName: originalMessage.from === tenant.whatsappConfig?.phoneNumberId
+            ? 'You'
+            : (originalMessage.from || 'Contact')
+        };
+
+        details.replyTo = originalMessage._id;
+      } else {
+        console.warn('⚠️ Original message not found');
+
+        details.quotedMessage = {
+          messageId: messageData.context.id,
+          text: 'Original message not available',
+          from: 'Unknown',
+          timestamp: new Date(),
+          type: 'text'
+        };
+      }
+    } catch (error) {
+      console.error('❌ Error looking up quoted message:', error);
+    }
+  }
+
+  switch (type) {
+    case 'text':
+      details.text = messageData.text?.body || '';
+      details.lastMessageText = details.text;
+      break;
+
+    case 'button':
+      details.text = messageData.button?.text || 'Button reply';
+      details.lastMessageText = details.text;
+      break;
+
+    case 'interactive':
+      if (messageData.interactive?.type === 'list_reply') {
+        details.text = messageData.interactive.list_reply?.title || 'Interactive message';
+        details.lastMessageText = details.text;
+      } else if (messageData.interactive?.type === 'button_reply') {
+        details.text = messageData.interactive.button_reply?.title || 'Button press';
+        details.lastMessageText = details.text;
+      } else if (messageData.interactive?.type === 'nfm_reply') {
+        console.log('Flow completion response detected');
+        const flowReply = messageData.interactive.nfm_reply;
+        details.isFlowCompletion = true;
+        details.text = flowReply?.body || 'Flow completed successfully';
+        details.lastMessageText = 'Order form completed';
+
+        if (flowReply?.response_json) {
+          try {
+            const flowResponseData = JSON.parse(flowReply.response_json);
+          details.flowResponseData = flowResponseData;
+
+              // Detect flow type from response fields
+              const isRegistrationFlow =
+                  flowResponseData.num_participants !== undefined ||
+                  flowResponseData.participants !== undefined ||
+                  flowResponseData.participant_count !== undefined;
+
+              details.text = isRegistrationFlow
+                  ? 'Registration details submitted successfully'
+                  : 'Order details submitted successfully';
+
+              details.lastMessageText = isRegistrationFlow
+                  ? 'Registration details submitted'
+                  : 'Order details submitted';
+
+    } catch (parseError) {
+            console.error('Error parsing flow response JSON:', parseError);
+            details.text = 'Flow completed (parsing error)';
+            details.lastMessageText = 'Flow completed';
+          }
+        }
+      } else {
+        details.text = 'Interactive message';
+        details.lastMessageText = details.text;
+      }
+
+      details.isInteractiveResponse = true;
+      details.interactiveData = messageData.interactive;
+      break;
+
+     case 'order':
+          console.log('📦 Processing order data:', JSON.stringify(messageData.order, null, 2));
+
+          const originalOrderData = messageData.order;
+          let totalPrice = 0;
+          const formattedItems = [];
+
+          if (originalOrderData.product_items && originalOrderData.product_items.length > 0) {
+            for (const item of originalOrderData.product_items) {
+              let inventoryItem = null;
+
+              try {
+                inventoryItem = await InventoryItem.findOne({
+                  tenant_id: tenant._id.toString(),
+                  retailer_id: item.product_retailer_id
+                });
+              } catch (err) {
+                console.error('Error looking up inventory item:', err);
+              }
+
+              const itemPrice = parseFloat(item.item_price || 0);
+              const quantity = parseInt(item.quantity || 1);
+              const itemTotal = itemPrice * quantity;
+              totalPrice += itemTotal;
+
+              formattedItems.push({
+                retailer_id: item.product_retailer_id,  // ✅ CRITICAL: Include retailer_id
+                id: item.product_retailer_id,
+                name: inventoryItem?.name || item.title || item.product_retailer_id,
+                price: itemPrice,
+                item_price: itemPrice,  // ✅ Add both for compatibility
+                quantity: quantity,
+                subtotal: itemTotal,
+                currency: item.currency || inventoryItem?.currency || 'INR',
+                image_url: inventoryItem?.image_url || item.thumbnail_url || null,
+                additional_images: inventoryItem?.additional_images || []
+              });
+            }
+          }
+
+          const itemNames = formattedItems.map(item => `${item.name} (${item.quantity}x)`).join(', ');
+          details.text = `Order: ${itemNames} - Total: ${originalOrderData.product_items?.[0]?.currency || 'INR'} ${totalPrice.toFixed(2)}`;
+          details.lastMessageText = `Order: ${formattedItems.length} item(s) - ${originalOrderData.product_items?.[0]?.currency || 'INR'} ${totalPrice.toFixed(2)}`;
+
+          // ✅ CRITICAL FIX: Properly structure orderData with all required fields
+          details.orderData = {
+            catalog_id: originalOrderData.catalog_id,
+            text: originalOrderData.text || details.text,
+            items: formattedItems,  // ✅ Array with retailer_id included
+            total: totalPrice.toFixed(2),
+            currency: originalOrderData.product_items?.[0]?.currency || 'INR',
+            order_id: 'ORD-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9),
+            raw_order_data: originalOrderData
+          };
+
+          console.log('✅ Order data structured:', {
+            itemsCount: details.orderData.items.length,
+            total: details.orderData.total,
+            currency: details.orderData.currency,
+            hasRetailerIds: details.orderData.items.every(item => item.retailer_id)
+          });
+          break;
+
+    default:
+      if (mediaTypes.includes(type)) {
+        const mediaTypeData = messageData[type];
+        details.caption = mediaTypeData?.caption || '';
+        details.filename = mediaTypeData?.filename || '';
+
+        const mediaTypeLabels = {
+          'image': 'Photo',
+          'video': 'Video',
+          'audio': 'Audio message',
+          'document': 'Document'
+        };
+
+        details.lastMessageText = mediaTypeLabels[type] || `${type.charAt(0).toUpperCase() + type.slice(1)} message`;
+
+        if (mediaTypeData?.id) {
+          try {
+            const mediaResult = await downloadMediaFromWhatsApp(
+              mediaTypeData.id,
+              tenant.whatsappConfig.accessToken,
+              tenant._id.toString()
+            );
+
+            if (mediaResult) {
+              details.mediaUrl = mediaResult.url;
+              details.s3Key = mediaResult.s3Key;
+              details.storage = 's3';
+              details.mimeType = mediaResult.mimeType;
+              details.text = mediaTypeData.caption || mediaTypeData.filename || details.lastMessageText;
+            }
+          } catch (err) {
+            console.error(`Failed to process ${type}:`, err);
+            details.text = `${type.charAt(0).toUpperCase() + type.slice(1)} message (media unavailable)`;
+          }
+        }
+      } else {
+        details.text = `${type.charAt(0).toUpperCase() + type.slice(1)} message`;
+        details.lastMessageText = `${type.charAt(0).toUpperCase() + type.slice(1)} message`;
+      }
+      break;
+  }
+
+  return details;
+}
+
+async function handleContactForWebhook(messageData, contactData, tenant, metadata) {
+  const phoneNumber = messageData.from;
+  const tenantId = tenant._id.toString();
+
+  console.log('Processing contact for webhook:', {
+    phoneNumber,
+    tenantId,
+    messageType: messageData.type,
+    hasContactData: !!contactData
+  });
+
+  try {
+    const getLastMessage = (messageData) => {
+      if (messageData.type === 'text' && messageData.text?.body) {
+        return messageData.text.body.substring(0, 100);
+      } else if (messageData.type === 'interactive') {
+        return 'Interactive message';
+      } else if (messageData.type === 'order') {
+        return 'Order placed';
+      } else {
+        return `${messageData.type.charAt(0).toUpperCase() + messageData.type.slice(1)} message`;
+      }
+    };
+
+    const lastMessage = getLastMessage(messageData);
+    const messageTimestamp = new Date(parseInt(messageData.timestamp) * 1000);
+
+    const getContactName = (contactData, phoneNumber) => {
+      if (contactData?.profile?.name && contactData.profile.name.trim()) {
+        return contactData.profile.name.trim();
+      }
+      const cleanPhone = phoneNumber.replace(/^\+?91/, '').replace(/^91/, '');
+      return cleanPhone;
+    };
+
+    const contactName = getContactName(contactData, phoneNumber);
+
+    // Check if contact exists
+    let existingContact = await Contact.findOne({
+      tenantId: tenantId,
+      phone_number: phoneNumber
+    });
+
+    const isNewContact = !existingContact;
+
+    // Use findOneAndUpdate with upsert for atomic operation
+    const contact = await Contact.findOneAndUpdate(
+      {
+        tenantId: tenantId,
+        phone_number: phoneNumber
+      },
+      {
+        $set: {
+          profile_name: contactData?.profile?.name || null,
+          name: contactName,
+          lastMessage: lastMessage,
+          lastMessageType: messageData.type,
+          timestamp: messageTimestamp,
+          source: 'whatsapp',
+          status: 'active'
+        },
+        $inc: { unreadCount: 1 }
+      },
+      {
+        upsert: true,
+        new: true,
+        setDefaultsOnInsert: true
+      }
+    );
+
+    console.log('Contact upsert successful:', {
+      contactId: contact._id,
+      name: contact.name,
+      phoneNumber: contact.phone_number,
+      isNew: isNewContact
+    });
+
+    // Emit new contact immediately for real-time updates
+    if (isNewContact && global.io) {
+      console.log('NEW CONTACT - Emitting to UI:', contact.phone_number);
+
+      global.io.to(tenantId).emit('new_contact', {
+        contact: contact.toObject(),
+        tenantId: tenantId,
+        timestamp: new Date(),
+        isNewContact: true
+      });
+
+      // Also emit contact updated
+      global.io.to(tenantId).emit('contact_updated', {
+        contact: contact.toObject(),
+        tenantId: tenantId,
+        timestamp: new Date(),
+        action: 'new_contact'
+      });
+    }
+
+    return contact;
+
+  } catch (error) {
+    console.error('Contact handling error:', error);
+
+    // Create minimal contact object for continued processing
+    const getContactName = (contactData, phoneNumber) => {
+      if (contactData?.profile?.name && contactData.profile.name.trim()) {
+        return contactData.profile.name.trim();
+      }
+      const cleanPhone = phoneNumber.replace(/^\+?91/, '').replace(/^91/, '');
+      return cleanPhone;
+    };
+
+    const getLastMessage = (messageData) => {
+      if (messageData.type === 'text' && messageData.text?.body) {
+        return messageData.text.body.substring(0, 100);
+      } else if (messageData.type === 'interactive') {
+        return 'Interactive message';
+      } else if (messageData.type === 'order') {
+        return 'Order placed';
+      } else {
+        return `${messageData.type.charAt(0).toUpperCase() + messageData.type.slice(1)} message`;
+      }
+    };
+
+    const fallbackContact = {
+      _id: new mongoose.Types.ObjectId(),
+      tenantId: tenantId,
+      phone_number: phoneNumber,
+      profile_name: contactData?.profile?.name || null,
+      name: getContactName(contactData, phoneNumber),
+      lastMessage: getLastMessage(messageData),
+      timestamp: new Date(),
+      unreadCount: 1,
+      source: 'whatsapp',
+      toObject: function () { return this; }
+    };
+
+    // Emit fallback contact as new contact
+    if (global.io) {
+      global.io.to(tenantId).emit('new_contact', {
+        contact: fallbackContact,
+        tenantId: tenantId,
+        timestamp: new Date(),
+        isNewContact: true
+      });
+    }
+
+    return fallbackContact;
+  }
+}
+
+function emitMessageToSocket(tenant, newMessage, contact, metadata) {
+  if (global.io) {
+    const messageData = {
+      ...newMessage.toObject(),
+      contact: contact.toObject ? contact.toObject() : contact,
+      metadata: metadata
+    };
+
+    // ✅ CRITICAL: Add unique emission ID to prevent double-processing
+    const emissionId = `${newMessage._id || newMessage.messageId}-${Date.now()}`;
+    messageData._emissionId = emissionId;
+
+    console.log('🔥 EMITTING MESSAGE TO UI:', {
+      messageId: newMessage._id,
+      emissionId: emissionId,
+      from: newMessage.from,
+      type: newMessage.type,
+      text: newMessage.text?.substring(0, 30) + '...',
+      mediaUrl: newMessage.mediaUrl?.substring(0, 50),
+      tenantId: tenant._id
+    });
+
+    // Emit to tenant room
+    global.io.to(tenant._id.toString()).emit('receive_message', messageData);
+
+    // Also emit to specific chat room for real-time updates
+    const chatRoom = `chat_${tenant._id}_${newMessage.from}`;
+    global.io.to(chatRoom).emit('receive_message', messageData);
+
+    // Emit contact update
+    global.io.to(tenant._id.toString()).emit('contact_updated', {
+      contact: contact.toObject ? contact.toObject() : contact,
+      tenantId: tenant._id.toString(),
+      timestamp: new Date(),
+      action: 'message_received'
+    });
+
+    // Emit new contact event if it's a new contact
+    global.io.to(tenant._id.toString()).emit('new_contact_message', {
+      contact: contact.toObject ? contact.toObject() : contact,
+      message: messageData,
+      tenantId: tenant._id.toString(),
+      timestamp: new Date()
+    });
+
+    console.log('✅ Message emitted to socket rooms successfully');
+  }
+}
+
+const sendOrderFlowMessage = async (orderData, messageData, tenant, metadata) => {
+  try {
+    console.log('🔄 Processing order flow trigger for:', messageData.from);
+
+    // 1. Fetch Tenant Settings
+    const Settings = require('../models/settings');
+    let settings;
+    // Handle static vs instance method availability
+    if (typeof Settings.initializeForTenant === 'function') {
+      settings = await Settings.initializeForTenant(tenant._id.toString());
+    } else {
+      settings = await Settings.findOne({ tenant_id: tenant._id.toString() });
+    }
+
+    if (!settings) {
+      console.warn('No settings found, using fallback.');
+      return await sendFallbackOrderMessage(messageData.from, orderData, tenant);
+    }
+
+    // 2. Check Configuration
+    const flowConfig = settings.automationConfig?.orderFlow;
+
+    // Check if enabled (defaulting to false if undefined to be safe)
+    if (!flowConfig?.enabled) {
+      console.log(`🔕 Order Flow is DISABLED for tenant: ${tenant._id}`);
+      // Optional: Send text fallback
+      const whatsappService = new WhatsAppService(tenant);
+      await whatsappService.sendMessage(messageData.from, "Thank you! We have received your cart and will process it manually.");
+      return;
+    }
+
+    if (!flowConfig.flowId) {
+      console.error('❌ Flow ID missing in settings');
+      return await sendFallbackOrderMessage(messageData.from, orderData, tenant);
+    }
+
+    // 3. Prepare Data
+    const whatsappService = new WhatsAppService(tenant);
+    const formattedPhone = whatsappService.formatPhoneNumber(messageData.from);
+    const flowToken = require('crypto').randomBytes(32).toString('hex');
+
+    const totalItems = orderData.items?.length || 0;
+    const totalAmount = orderData.total || '0';
+    const currency = orderData.currency || 'INR';
+
+    const template = flowConfig.template || {};
+
+    // ✅ FIX: Define State List (This was missing)
+    const stateList = [
+      { id: "AP", title: "Andhra Pradesh" }, { id: "AR", title: "Arunachal Pradesh" },
+      { id: "AS", title: "Assam" }, { id: "BR", title: "Bihar" },
+      { id: "CT", title: "Chhattisgarh" }, { id: "GA", title: "Goa" },
+      { id: "GJ", title: "Gujarat" }, { id: "HR", title: "Haryana" },
+      { id: "HP", title: "Himachal Pradesh" }, { id: "JH", title: "Jharkhand" },
+      { id: "KA", title: "Karnataka" }, { id: "KL", title: "Kerala" },
+      { id: "MP", title: "Madhya Pradesh" }, { id: "MH", title: "Maharashtra" },
+      { id: "MN", "title": "Manipur" }, { id: "ML", "title": "Meghalaya" },
+      { id: "MZ", "title": "Mizoram" }, { id: "NL", "title": "Nagaland" },
+      { id: "OR", "title": "Odisha" }, { id: "PB", "title": "Punjab" },
+      { id: "RJ", "title": "Rajasthan" }, { id: "SK", "title": "Sikkim" },
+      { id: "TN", "title": "Tamil Nadu" }, { id: "TG", "title": "Telangana" },
+      { id: "TR", "title": "Tripura" }, { id: "UP", "title": "Uttar Pradesh" },
+      { id: "UT", "title": "Uttarakhand" }, { id: "WB", "title": "West Bengal" },
+      { id: "AN", "title": "Andaman and Nicobar Islands" },
+      { id: "CH", "title": "Chandigarh" }, { id: "DN", "title": "Dadra and Nagar Haveli" },
+      { id: "DL", "title": "Delhi" }, { id: "JK", "title": "Jammu and Kashmir" },
+      { id: "LA", "title": "Ladakh" }, { id: "LD", "title": "Lakshadweep" },
+      { id: "PY", "title": "Puducherry" }
+    ];
+
+    // 4. Construct Payload
+    const messagePayload = {
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: formattedPhone,
+      type: 'interactive',
+      interactive: {
+        type: 'flow',
+        header: {
+          type: 'text',
+          text: template.header || '🛍️ Complete Your Order'
+        },
+        body: {
+          text: `${template.body || 'Please confirm details.'}\n\n🛒 Items: ${totalItems}\n💰 Total: ${currency} ${totalAmount}`
+        },
+        footer: {
+          text: template.footer || 'Powered by GoWhats!'
+        },
+        action: {
+          name: 'flow',
+          parameters: {
+            flow_message_version: '3',
+            flow_id: flowConfig.flowId,
+            flow_token: flowToken,
+            flow_cta: template.ctaText || 'Checkout Now',
+            mode: 'published',
+            flow_action: 'navigate',
+            flow_action_payload: {
+              screen: 'DETAILS',
+              data: {
+                order_total: totalAmount,
+                currency: currency,
+                item_count: totalItems,
+                // ✅ PASS THE STATE LIST HERE
+                state: stateList,
+                states: stateList // Sending as both keys to be safe
+              }
+            }
+          }
+        }
+      }
+    };
+
+    console.log('🚀 Sending configured flow to:', formattedPhone);
+
+    // 5. Send Request
+    const axios = require('axios');
+    const response = await axios.post(
+      `${whatsappService.baseUrl}/${tenant.whatsappConfig.phoneNumberId}/messages`,
+      messagePayload,
+      { headers: { Authorization: `Bearer ${tenant.whatsappConfig.accessToken}` } }
+    );
+
+    // 6. Save State
+    if (response.data?.messages) {
+      // Save Message to DB
+      const flowMessage = new Message({
+        tenantId: tenant._id,
+        from: metadata?.phone_number_id,
+        to: messageData.from,
+        text: `Order Flow Sent (${totalItems} items)`,
+        type: 'flow',
+        subType: 'order_completion',
+        status: 'sent',
+        messageId: response.data.messages[0].id,
+        orderData: orderData,
+        flowId: flowConfig.flowId
+      });
+      await flowMessage.save();
+
+      // Update Flow Token
+      const FlowToken = require('../models/FlowToken');
+      await FlowToken.deleteMany({ tenantId: tenant._id.toString(), phoneNumber: formattedPhone, status: 'active' });
+      await FlowToken.create({
+        tenantId: tenant._id.toString(),
+        token: flowToken,
+        flowId: flowConfig.flowId,
+        phoneNumber: formattedPhone,
+        flowType: 'order_completion',
+        status: 'active',
+        createdAt: new Date(),
+        contextData: orderData
+      });
+
+      // Emit to UI
+      if (global.io) {
+        global.io.to(tenant._id.toString()).emit('message_sent', {
+          ...flowMessage.toObject(),
+          contact: { phone_number: messageData.from }
+        });
+      }
+    }
+
+  } catch (error) {
+    console.error('❌ Error sending order flow:', error.message);
+    try { await sendFallbackOrderMessage(messageData.from, orderData, tenant); } catch (e) {}
+  }
+};
+
+
+// ============================================================
+// 🛍️ ORDER AUTOMATION HANDLER (With Shipping Integration)
+// ============================================================
+async function handleFlowCompletionWithShipping(messageData, tenant, metadata) {
+  try {
+    console.log('📦 ====== ROUTING TO ORDER HANDLER ======');
+
+    const flowReply = messageData.interactive?.nfm_reply;
+    if (!flowReply) return;
+
+    let rawFlowData;
+    try { rawFlowData = JSON.parse(flowReply.response_json); } catch (e) { return; }
+
+    const flowData = rawFlowData.customer_details || rawFlowData.data || rawFlowData;
+
+    // 1. Fetch Settings & Check Toggle
+    const Settings = require('../models/settings');
+    let settings = await Settings.findOne({ tenant_id: tenant._id.toString() });
+
+    if (settings?.automationConfig?.orderFlow?.enabled === false) {
+      console.log(`🔕 Order Flow is DISABLED for tenant: ${tenant._id}. Ignoring flow completion.`);
+      return;
+    }
+
+    // 2. Retrieve Token for Price
+    const FlowToken = require('../models/FlowToken');
+    const tokenRecord = await FlowToken.findOne({ token: rawFlowData.flow_token, tenantId: tenant._id.toString() });
+
+    let orderAmount = 0;
+    let orderItems = [];
+
+    if (rawFlowData.order_total) orderAmount = parseFloat(rawFlowData.order_total);
+    else if (tokenRecord && tokenRecord.contextData) {
+        orderAmount = parseFloat(tokenRecord.contextData.total || 0);
+        orderItems = tokenRecord.contextData.items || [];
+    } else if (tokenRecord && tokenRecord.orderData) {
+        orderAmount = parseFloat(tokenRecord.orderData.total || 0);
+        orderItems = tokenRecord.orderData.items || [];
+    }
+
+    // 🛑🛑 CRITICAL FIX: STOP EMPTY ORDERS 🛑🛑
+    // If we have no items OR the total amount is 0, do NOT proceed.
+    if (!orderItems || orderItems.length === 0 || orderAmount <= 0) {
+        console.warn(`⚠️ Blocked Empty/Invalid Order from ${messageData.from}. Amount: ${orderAmount}, Items: ${orderItems?.length}`);
+
+        const whatsappService = new WhatsAppService(tenant);
+        await whatsappService.sendMessage(messageData.from, "⚠️ We could not retrieve your cart items or the session has expired. Please add items to your cart again and retry.");
+        return; // STOP EXECUTION HERE
+    }
+    // 🛑🛑 END FIX 🛑🛑
+
+    // 3. Create & Save Order
+    const Order = require('../models/Order');
+    const { generateOrderId } = require('../utils/orderUtils');
+
+    const orderId = await generateOrderId(tenant._id.toString(), 'order');
+
+    const newOrder = new Order({
+        tenantId: tenant._id.toString(),
+        orderId: orderId,
+        orderNumber: orderId,
+        customerPhone: messageData.from,
+        customerDetails: { name: flowData.name || 'Customer', email: flowData.email || "", phone: messageData.from },
+        shippingAddress: {
+            name: flowData.name || 'Customer',
+            addressLine1: flowData.address || flowData.address_1,
+            addressLine2: flowData.landmark || flowData.address_2 || "",
+            city: flowData.city,
+            state: flowData.state,
+            pincode: flowData.zip_code || flowData.pincode || flowData.postal_code,
+            country: 'India',
+            phone: messageData.from
+        },
+        registrationDetails: rawFlowData,
+        orderAmount: orderAmount,
+        totalAmount: orderAmount,
+        currency: 'INR',
+        status: 'pending',
+        paymentStatus: 'pending',
+        source: 'whatsapp_flow',
+        flowToken: rawFlowData.flow_token,
+        items: orderItems
+    });
+
+    await newOrder.save();
+    console.log(`✅ Order ${orderId} Created & Saved.`);
+
+    // 🛑 STOP ABANDONED CART TIMER
+    try {
+        const abandonedCartService = require('../services/abandonedCartService');
+        abandonedCartService.cancelTimer(tenant._id.toString(), messageData.from);
+    } catch (e) { console.error('Error cancelling cart timer:', e); }
+
+    const whatsappService = new WhatsAppService(tenant);
+
+    // 4. Shipping Logic
+    const isShippingEnabled = settings?.automationConfig?.shippingSelection?.enabled !== false;
+
+    if (isShippingEnabled) {
+        const ShippingMethod = require('../models/ShippingMethod');
+        const activeMethodsCount = await ShippingMethod.countDocuments({ tenantId: tenant._id.toString(), isActive: true });
+
+        if (activeMethodsCount > 0) {
+            const ShippingCalculation = require('../models/ShippingCalculation');
+            const calculation = new ShippingCalculation({
+                tenantId: tenant._id.toString(),
+                customerPhone: messageData.from,
+                orderDetails: { orderId: orderId, orderAmount: orderAmount, currency: 'INR', itemCount: newOrder.items.length || 1 },
+                customerAddress: newOrder.shippingAddress,
+                flowToken: rawFlowData.flow_token,
+                calculationStatus: 'pending'
+            });
+
+            const options = await calculation.calculateShippingOptions();
+            await calculation.save();
+
+            const validOption = options.find(o => o.isEligible);
+
+            if (validOption) {
+                await calculation.selectShippingMethod(validOption.methodId, validOption.methodName, validOption.shippingCost);
+                const totalWithShipping = orderAmount + validOption.shippingCost;
+
+                await Order.findOneAndUpdate(
+                    { orderId: orderId, tenantId: tenant._id.toString() },
+                    {
+                        $set: {
+                            shippingCost: validOption.shippingCost,
+                            totalAmount: totalWithShipping,
+                            shippingMethod: { name: validOption.methodName, cost: validOption.shippingCost, providerId: validOption.methodId },
+                            status: 'shipping_selected'
+                        }
+                    }
+                );
+
+                let messageText = `🚚 *Shipping Calculated*\nMethod: ${validOption.methodName}\nTotal: ₹${totalWithShipping.toFixed(2)}`;
+                if (validOption.isFreeShipping || validOption.shippingCost === 0) {
+                    messageText = `🎉 Free Shipping Applied!\nTotal: ₹${totalWithShipping.toFixed(2)}`;
+                }
+                await whatsappService.sendMessage(messageData.from, messageText);
+
+                if (settings?.automationConfig?.paymentRequest?.enabled !== false) {
+                    await sendPaymentMessage(calculation, messageData, tenant, metadata);
+                }
+                return;
+            }
+        }
+    }
+
+    // 5. Fallback Logic (Direct Payment)
+    if (settings?.automationConfig?.paymentRequest?.enabled !== false && newOrder.totalAmount > 0) {
+        const paymentConfigurationName = settings?.automationConfig?.paymentRequest?.paymentConfigurationName;
+
+        const paymentPayload = {
+            reference_id: orderId,
+            type: 'physical-goods',
+            currency: 'INR',
+            total_amount: {
+                value: Math.round(newOrder.totalAmount * 100),
+                offset: 100
+            },
+            payment_settings: [{
+                type: 'payment_gateway',
+                payment_gateway: {
+                    type: 'razorpay',
+                    configuration_name: paymentConfigurationName,
+                    razorpay: { receipt: orderId, notes: { type: "ecommerce", order_id: orderId } }
+                }
+            }],
+            order: {
+                status: 'pending',
+                items: [{
+                    name: `Order #${orderId}`,
+                    amount: { value: Math.round(newOrder.totalAmount * 100), offset: 100 },
+                    quantity: 1
+                }],
+                subtotal: { value: Math.round(newOrder.totalAmount * 100), offset: 100 }
+            }
+        };
+
+        await whatsappService.sendPaymentOrderDetails(
+            messageData.from,
+            paymentPayload,
+            settings?.automationConfig?.paymentRequest?.template
+        );
+
+    } else {
+        await whatsappService.sendMessage(messageData.from, `✅ Order Placed! ID: ${orderId}\nWe will contact you shortly.`);
+    }
+
+  } catch (error) {
+    console.error('❌ Order Handler Error:', error);
+  }
+}
+
+
+function createShippingConfirmationMessage(calculation, orderId, selected, customerAddress) {
+  // ✅ FIX: Look for Order ID in multiple places to prevent "undefined"
+  const finalOrderId = orderId || calculation.orderId || calculation.orderDetails?.orderId || 'PENDING';
+
+  const orderAmount = calculation.orderDetails.orderAmount;
+  const shippingCost = selected.shippingCost;
+  const totalCost = selected.totalCost;
+  const itemCount = calculation.orderDetails.itemCount || 1;
+
+  let shippingDisplay;
+  if (shippingCost === 0) {
+    const originalOption = calculation.availableShippingOptions.find(
+      opt => opt.methodId.toString() === selected.methodId.toString()
+    );
+
+    if (originalOption && originalOption.isFreeShipping) {
+      shippingDisplay = "🆓 FREE SHIPPING";
+    } else {
+      shippingDisplay = "₹0.00 (Free)";
+    }
+  } else {
+    shippingDisplay = `₹${shippingCost.toFixed(2)}`;
+  }
+
+  const message = `🚚 *Shipping Method Confirmed!*
+
+Dear ${customerAddress.name || 'Customer'}, your shipping details have been confirmed.
+
+📦 *Order Details:*
+- Order ID: *${finalOrderId}*
+- Items: ${itemCount} item(s)
+- Order Amount: ₹${orderAmount.toFixed(2)}
+- Shipping: ${shippingDisplay}
+- *Total Amount: ₹${totalCost.toFixed(2)}*
+
+🚚 *Delivery Method:* ${selected.methodName}
+📍 *Delivery Address:*
+${customerAddress.addressLine1}
+${customerAddress.city}, ${customerAddress.state} - ${customerAddress.pincode}
+
+💡 Your payment link will be sent shortly to complete the order.
+
+_Powered by GoWhats!_`;
+
+  return message;
+}
+
+// ============================================================
+// 🔍 REGISTRATION TRIGGER CHECKER
+// ============================================================
+async function checkRegistrationTrigger(messageText, tenant) {
+  try {
+    if (!messageText || typeof messageText !== 'string') return null;
+
+    // ✅ Keep original case for comparison
+    const userMessage = messageText.trim();
+
+    console.log('🔍 Checking registration trigger:', {
+      originalText: messageText,
+      userMessage,
+      tenantId: tenant._id
+    });
+
+    const configs = await RegistrationConfig.find({
+      tenantId: tenant._id,
+      isActive: true
+    });
+
+    for (const config of configs) {
+      // ✅ Don't convert trigger words to lowercase during retrieval
+      const triggerWords = Array.isArray(config.triggerWord)
+        ? config.triggerWord.map(w => w.trim())
+        : String(config.triggerWord).split(',').map(w => w.trim());
+
+      console.log('📋 Checking trigger words for config:', triggerWords);
+
+      // ✅ Case-insensitive comparison
+      if (triggerWords.some(word => {
+        const wordLower = word.toLowerCase();
+        const messageLower = userMessage.toLowerCase();
+        return messageLower === wordLower || messageLower.includes(wordLower);
+      })) {
+        console.log('✅ Matched trigger word:', { userMessage, triggerWords });
+        await config.incrementScanCount();
+        return config;
+      }
+    }
+
+    console.log('❌ No registration trigger match found');
+    return null;
+
+  } catch (error) {
+    console.error('❌ Error checking registration trigger:', error);
+    return null;
+  }
+}
+
+async function handleFlowCompletion(messageData, tenant, metadata) {
+  try {
+    console.log('Processing flow completion:', {
+      from: messageData.from,
+      type: messageData.type,
+      interactiveType: messageData.interactive?.type,
+      hasResponseJson: !!messageData.interactive?.nfm_reply?.response_json
+    });
+
+    const flowReply = messageData.interactive?.nfm_reply;
+
+    if (!flowReply) {
+      console.error('No flow reply data found');
+      return;
+    }
+
+    let flowResponseData = {};
+
+    if (flowReply.response_json) {
+      try {
+        flowResponseData = JSON.parse(flowReply.response_json);
+        console.log('Flow response data parsed:', {
+          flowToken: flowResponseData.flow_token?.substring(0, 8) + '...' || 'none',
+          status: flowResponseData.status,
+          tenantId: flowResponseData.tenant_id,
+          orderConfirmed: flowResponseData.order_confirmed
+        });
+      } catch (parseError) {
+        console.error('Error parsing flow response JSON:', parseError);
+        flowResponseData = {
+          status: 'completed',
+          flow_token: 'unknown',
+          tenant_id: tenant._id.toString()
+        };
+      }
+    } else {
+      console.warn('No response JSON in flow completion');
+      flowResponseData = {
+        status: 'completed',
+        flow_token: 'no_response_json',
+        tenant_id: tenant._id.toString()
+      };
+    }
+
+    if (flowResponseData.flow_token && flowResponseData.flow_token !== 'unknown') {
+      try {
+
+        const updatedToken = await FlowToken.markAsUsed(
+          tenant._id.toString(),
+          flowResponseData.flow_token,
+          flowResponseData
+        );
+
+        if (updatedToken) {
+          console.log('Flow token marked as used:', {
+            token: flowResponseData.flow_token.substring(0, 8) + '...',
+            phoneNumber: updatedToken.phoneNumber
+          });
+        } else {
+          console.warn('Flow token not found or already used');
+        }
+      } catch (tokenError) {
+        console.error('Error updating flow token:', tokenError);
+      }
+    }
+
+    if (flowResponseData.status === 'completed' || flowResponseData.order_confirmed) {
+      try {
+        const whatsappService = new WhatsAppService(tenant);
+
+        let acknowledgmentMessage;
+
+        if (flowResponseData.order_confirmed) {
+          acknowledgmentMessage = `Thank you! Your order has been confirmed successfully.\n\n` +
+            `Order ID: ${flowResponseData.order_id || 'Will be provided shortly'}\n` +
+            `We'll send you regular updates about your order status.\n\n` +
+            `Need help? Just reply to this message.`;
+        } else {
+          acknowledgmentMessage = `Thank you! Your information has been received and is being processed.\n\n` +
+            `We'll get back to you shortly with the next steps.`;
+        }
+
+        const ackResponse = await whatsappService.sendMessage(messageData.from, acknowledgmentMessage);
+
+        if (ackResponse) {
+          console.log('Flow completion acknowledgment sent:', {
+            messageId: ackResponse.messages?.[0]?.id,
+            recipient: messageData.from
+          });
+
+          const ackMessage = new Message({
+            tenantId: tenant._id,
+            from: metadata.phone_number_id,
+            to: messageData.from,
+            text: acknowledgmentMessage,
+            type: 'text',
+            timestamp: new Date(),
+            messageId: ackResponse.messages?.[0]?.id,
+            status: 'sent',
+            isFlowAcknowledgment: true,
+            flowToken: flowResponseData.flow_token
+          });
+
+          await ackMessage.save();
+
+          if (global.io) {
+            global.io.to(tenant._id.toString()).emit('message_sent', {
+              ...ackMessage.toObject(),
+              contact: { phone_number: messageData.from }
+            });
+          }
+        }
+      } catch (ackError) {
+        console.error('Error sending flow completion acknowledgment:', ackError);
+      }
+    }
+
+    if (global.io) {
+      global.io.to(tenant._id.toString()).emit('flow_completed', {
+        phoneNumber: messageData.from,
+        flowData: flowResponseData,
+        completedAt: new Date(),
+        tenantId: tenant._id,
+        orderConfirmed: flowResponseData.order_confirmed || false,
+        orderId: flowResponseData.order_id || null
+      });
+
+      console.log('Flow completion event emitted to admin panel');
+    }
+
+    await updateFlowUsageStats(tenant._id.toString(), 'order_completion');
+
+  } catch (error) {
+    console.error('Critical error handling flow completion:', {
+      error: error.message,
+      stack: error.stack,
+      messageData: messageData,
+      tenantId: tenant._id
+    });
+
+    try {
+      const whatsappService = new WhatsAppService(tenant);
+
+      const errorMessage = `We encountered an issue processing your request. Our team has been notified and will assist you shortly.\n\nPlease try again or contact support if the issue persists.`;
+
+      await whatsappService.sendMessage(messageData.from, errorMessage);
+      console.log('Error acknowledgment sent to user');
+    } catch (errorMsgError) {
+      console.error('Failed to send error acknowledgment:', errorMsgError);
+    }
+  }
+}
+
+async function sendPaymentMessage(calculation, messageData, tenant, metadata) {
+  try {
+    const orderId = calculation.orderDetails.orderId;
+    console.log('PAYMENT: Processing for order:', orderId);
+
+    // 1. Fetch Settings & Check if Enabled
+    const Settings = require('../models/settings');
+    const settings = await Settings.findOne({ tenant_id: tenant._id.toString() });
+
+    const paymentConfig = settings?.automationConfig?.paymentRequest;
+
+    if (paymentConfig && paymentConfig.enabled === false) {
+        console.log('🔕 Payment Request disabled for tenant');
+        return;
+    }
+
+    // Determine Razorpay Config Name (New > Old)
+    const razorpayConfigName = paymentConfig?.paymentConfigurationName || settings?.flowConfig?.paymentConfigurationName;
+
+    if (!razorpayConfigName) {
+      console.log('❌ No Razorpay config name found in settings');
+      return;
+    }
+
+    // 2. Get Order Data
+    const Order = require('../models/Order');
+    const order = await Order.findOne({ tenantId: tenant._id.toString(), orderId: orderId });
+    if (!order) throw new Error('Order not found');
+
+    // 3. Prepare Payment Data
+    // Use selected shipping cost + order amount if available, or fall back to order total
+    const totalAmount = calculation.selectedShipping?.totalCost || order.totalAmount;
+    const amountInPaise = Math.round(totalAmount * 100);
+
+    const paymentOrderPayload = {
+      reference_id: order.orderId,
+      type: 'physical-goods',
+      currency: 'INR',
+      total_amount: { value: amountInPaise, offset: 100 },
+      payment_settings: [{
+        type: 'payment_gateway',
+        payment_gateway: {
+          type: 'razorpay',
+          configuration_name: razorpayConfigName,
+          razorpay: {
+            receipt: `receipt_${order.orderId}`,
+            notes: {
+              order_id: order.orderId,
+              tenant_id: tenant._id.toString(),
+              type: 'ecommerce'
+            }
+          }
+        }
+      }],
+      order: {
+        status: 'pending',
+        items: [{
+            name: `Order ${order.orderId}`,
+            amount: { value: amountInPaise, offset: 100 },
+            quantity: 1
+        }],
+        subtotal: { value: amountInPaise, offset: 100 }
+      }
+    };
+
+    // 4. Prepare Custom Message Content
+    const customMessage = {
+        header: paymentConfig?.template?.header || '💳 Complete Your Payment',
+        body: paymentConfig?.template?.body || 'Please complete your payment.',
+        footer: paymentConfig?.template?.footer || 'Powered by GoWhats!'
+    };
+
+    // Replace variables in body text
+    customMessage.body = customMessage.body
+        .replace('{{amount}}', `₹${totalAmount.toFixed(2)}`)
+        .replace('{{order_id}}', order.orderId);
+
+    // 5. Send via WhatsApp Service
+    const whatsappService = new WhatsAppService(tenant);
+    const response = await whatsappService.sendPaymentOrderDetails(
+        messageData.from,
+        paymentOrderPayload,
+        customMessage
+    );
+
+    // 6. Save Message & Emit Socket Event
+    if (response) {
+       console.log('✅ Payment link sent successfully');
+
+       const Message = require('../models/Message');
+       const Contact = require('../models/Contact');
+
+       // Save to Database
+       const paymentMessage = new Message({
+            tenantId: tenant._id,
+            from: metadata?.phone_number_id || tenant.whatsappConfig?.phoneNumberId || 'system',
+            to: messageData.from,
+            text: `Payment Link sent: ${customMessage.header} - ₹${totalAmount.toFixed(2)}`,
+            type: 'interactive',
+            subType: 'order_details',
+            timestamp: new Date(),
+            messageId: response.messages?.[0]?.id,
+            status: 'sent',
+            isPaymentMessage: true,
+            isAutomatedMessage: true,
+            orderId: order.orderId,
+            orderData: {
+                orderId: order.orderId,
+                total: totalAmount.toString(),
+                currency: 'INR',
+                status: 'pending_payment'
+            }
+       });
+
+       await paymentMessage.save();
+
+       // Update Contact
+       await Contact.findOneAndUpdate(
+        {
+          tenantId: tenant._id.toString(),
+          phone_number: messageData.from
+        },
+        {
+          $set: {
+            lastMessage: `Payment Link - Order #${order.orderId}`,
+            timestamp: new Date()
+          }
+        },
+        { upsert: true }
+      );
+
+       // Emit to Socket for Real-time UI
+       if (global.io) {
+          global.io.to(tenant._id.toString()).emit('message_sent', {
+            ...paymentMessage.toObject(),
+            contact: { phone_number: messageData.from }
+          });
+
+          global.io.to(tenant._id.toString()).emit('payment_order_sent', {
+            customerPhone: messageData.from,
+            orderId: order.orderId,
+            amount: totalAmount,
+            tenantId: tenant._id
+          });
+       }
+    }
+
+  } catch (error) {
+    console.error('PAYMENT: Error sending payment link:', error.message);
+
+    // Optional: Send text fallback on error
+    try {
+        const whatsappService = new WhatsAppService(tenant);
+        await whatsappService.sendMessage(
+            messageData.from,
+            `We calculated your total as ₹${calculation.selectedShipping?.totalCost}. However, we couldn't generate the payment link. Our team will contact you shortly.`
+        );
+    } catch(e) { /* ignore fallback error */ }
+  }
+}
+
+  const handleInteractiveMessageResponse = async (messageData, tenant, metadata) => {
+  try {
+    const interactiveData = messageData.interactive;
+    let selectedOption = null;
+    let selectedId = null;
+
+    if (interactiveData?.type === 'button_reply') {
+      selectedOption = interactiveData.button_reply?.title;
+      selectedId = interactiveData.button_reply?.id;
+    } else if (interactiveData?.type === 'list_reply') {
+      selectedOption = interactiveData.list_reply?.title;
+      selectedId = interactiveData.list_reply?.id;
+    }
+
+    console.log('🔄 Interactive response received:', {
+      type: interactiveData?.type,
+      selectedOption,
+      selectedId,
+      from: messageData.from,
+    });
+
+    if (!selectedOption) {
+      console.log('❌ No valid interactive selection found. Aborting.');
+      return;
+    }
+
+    // =================================================================
+    // PRIORITY 1: Handle Shipping Partner Selection
+    // =================================================================
+    if (selectedId && selectedId.startsWith('shipping_')) {
+      console.log('🚚 Customer selected a courier. Processing shipping...');
+      try {
+        const methodId = selectedId.replace('shipping_', '');
+        const ShippingCalculation = require('../models/ShippingCalculation');
+        const Order = require('../models/Order');
+        const Contact = require('../models/Contact');
+        // const Message = require('../models/Message'); // Not needed if we skip confirmation text
+
+        const calculation = await ShippingCalculation.findOne({
+          tenantId: tenant._id.toString(),
+          customerPhone: messageData.from,
+          calculationStatus: { $in: ['pending', 'calculated'] },
+        }).sort({ createdAt: -1 });
+
+        if (!calculation) {
+          console.error('❌ No active shipping calculation found for this customer.');
+          return;
+        }
+
+        const selectedShippingOption = calculation.availableShippingOptions.find((opt) => opt.methodId.toString() === methodId);
+
+        if (!selectedShippingOption || !selectedShippingOption.isEligible) {
+          console.error('❌ Selected shipping option is not found or not eligible.');
+          return;
+        }
+
+        let finalShippingCost = selectedShippingOption.shippingCost;
+        let shippingMethodName = selectedShippingOption.methodName;
+
+        if (calculation.shouldApplyFreeShipping()) {
+          finalShippingCost = 0;
+          shippingMethodName = `${selectedShippingOption.methodName} (FREE SHIPPING)`;
+        }
+
+        // 1. Update Calculation
+        await calculation.selectShippingMethod(selectedShippingOption.methodId, shippingMethodName, finalShippingCost);
+
+        // 2. Update Order
+        if (calculation.orderId) {
+          await Order.findOneAndUpdate({ orderId: calculation.orderId, tenantId: tenant._id.toString() }, {
+            $set: {
+              shippingCost: finalShippingCost,
+              totalAmount: calculation.selectedShipping.totalCost,
+              shippingMethod: { name: shippingMethodName, cost: finalShippingCost, estimatedDays: selectedShippingOption.estimatedDays, providerId: selectedShippingOption.methodId, },
+              status: 'shipping_selected',
+            },
+          });
+        }
+
+        // 3. ✅ DIRECTLY SEND PAYMENT MESSAGE (Skipping Confirmation Text)
+        console.log('▶️ Shipping selected. Sending payment message immediately...');
+
+        // Pass the updated calculation to the payment function
+        // Note: Ensure sendPaymentMessage is defined in your webhook.js file scope
+        await sendPaymentMessage(calculation, messageData, tenant, metadata);
+
+      } catch (shippingError) {
+        console.error('❌ CRITICAL ERROR during shipping selection process:', shippingError);
+        const whatsappService = new WhatsAppService(tenant);
+        await whatsappService.sendMessage(messageData.from, "We're sorry, an unexpected error occurred. Our team has been notified.");
+      }
+      return; // Stop execution here
+    }
+
+    // =================================================================
+    // PRIORITY 2: Handle Bot Workflow Buttons (Existing Logic)
+    // =================================================================
+    const BotConfiguration = require('../models/WelcomeTemplates');
+    const botConfig = await BotConfiguration.findOne({
+      tenant_id: tenant._id.toString(),
+      isActive: true,
+    });
+
+    if (!botConfig) {
+      console.log('No active bot configuration found for other interactive replies.');
+      return;
+    }
+
+    const selectedWorkflow = botConfig.workflows.find(wf => wf.buttonText === selectedOption);
+
+    if (!selectedWorkflow) {
+      console.log(`⚠️ Unhandled interactive option: "${selectedOption}"`);
+      return;
+    }
+
+    const whatsappService = new WhatsAppService(tenant);
+    let responseMessageText = '';
+
+    switch (selectedWorkflow.workflow) {
+      case 'Visit Website': {
+        const visitWebsiteMsg = botConfig.workflowMessages?.find(wm => wm.workflow === 'Visit Website');
+        responseMessageText = visitWebsiteMsg?.message || `Here is our website: https://srfoodproducts.com 🙏`;
+        break;
+      }
+      case 'Shop Our Collection': {
+        const shopWorkflowMsg = botConfig.workflowMessages?.find(wm => wm.workflow === 'Shop Our Collection');
+        const catalogConfig = {
+            bodyText: shopWorkflowMsg?.message || "Welcome to our collection!",
+            footerText: "Powered by GoWhats!"
+        };
+        await whatsappService.sendCatalogMessage(messageData.from, catalogConfig);
+        return;
+      }
+      case 'Talk with Our Team': {
+        const talkWorkflowMsg = botConfig.workflowMessages?.find(wm => wm.workflow === 'Talk with Our Team');
+        responseMessageText = talkWorkflowMsg?.message || "Our team will be with you shortly!";
+        await Contact.findOneAndUpdate(
+            { tenantId: tenant._id.toString(), phone_number: messageData.from },
+            { $set: { botMode: false } }
+        );
+        break;
+      }
+      case 'Product Suggestions': {
+          const suggestionMsg = botConfig.workflowMessages?.find(wm => wm.workflow === 'Product Suggestions');
+          responseMessageText = suggestionMsg?.message || "AI Assistant activated! How can I help?";
+          await Contact.findOneAndUpdate(
+              { tenantId: tenant._id.toString(), phone_number: messageData.from },
+              { $set: { botMode: true } }
+          );
+          break;
+      }
+      default:
+        console.log(`- Unhandled workflow action: ${selectedWorkflow.workflow}`);
+        return;
+    }
+
+    if (responseMessageText) {
+      const response = await whatsappService.sendMessage(messageData.from, responseMessageText);
+      if (response && response.messages?.[0]?.id) {
+        const responseMessageDoc = new Message({
+            tenantId: tenant._id,
+            from: metadata.phone_number_id,
+            to: messageData.from,
+            text: responseMessageText,
+            timestamp: new Date(),
+            messageId: response.messages[0].id,
+            status: 'sent',
+            type: 'text',
+            isAutomatedMessage: true,
+            workflowTriggered: selectedWorkflow.workflow,
+        });
+        await responseMessageDoc.save();
+        if (global.io) {
+            global.io.to(tenant._id.toString()).emit('message_sent', {
+                ...responseMessageDoc.toObject(),
+                contact: { phone_number: messageData.from }
+            });
+        }
+      }
+    }
+
+  } catch (error) {
+    console.error('❌ FATAL ERROR in handleInteractiveMessageResponse:', error);
+  }
+};
+
+// Helper function to create shipping confirmation message
+function createShippingConfirmationMessage(calculation, orderId, selected, customerAddress) {
+  const orderAmount = calculation.orderDetails.orderAmount;
+  const shippingCost = selected.shippingCost;
+  const totalCost = selected.totalCost;
+  const itemCount = calculation.orderDetails.itemCount || 1;
+
+  let shippingDisplay;
+  if (shippingCost === 0) {
+    const originalOption = calculation.availableShippingOptions.find(
+      opt => opt.methodId.toString() === selected.methodId.toString()
+    );
+
+    if (originalOption && originalOption.isFreeShipping) {
+      shippingDisplay = "🆓 FREE SHIPPING";
+    } else {
+      shippingDisplay = "₹0.00 (Free)";
+    }
+  } else {
+    shippingDisplay = `₹${shippingCost.toFixed(2)}`;
+  }
+
+  const message = `🚚 *Shipping Method Confirmed!*
+
+Dear ${customerAddress.name || 'Customer'}, your shipping details have been confirmed.
+
+📦 *Order Details:*
+- Order ID: *${orderId}*
+- Items: ${itemCount} item(s)
+- Order Amount: ₹${orderAmount.toFixed(2)}
+- Shipping: ${shippingDisplay}
+- *Total Amount: ₹${totalCost.toFixed(2)}*
+
+🚚 *Delivery Method:* ${selected.methodName}
+📍 *Delivery Address:*
+${customerAddress.addressLine1}
+${customerAddress.city}, ${customerAddress.state} - ${customerAddress.pincode}
+
+💡 Your payment link will be sent shortly to complete the order.
+
+_Powered by GoWhats!_`;
+
+  return message;
+}
+
+// MAIN ROUTER POST HANDLER
+router.post('/', attachTenant, async (req, res) => {
+  try {
+    const { body, tenant } = req;
+    if (!tenant) {
+      console.error('❌ Tenant not found in request, aborting.');
+      return res.sendStatus(404);
+    }
+
+    const entry = body.entry?.[0];
+    const changes = entry?.changes?.[0];
+    const value = changes?.value;
+    const field = changes?.field;
+
+    // ============================================
+    // 1. Handle WhatsApp Business App Webhooks (System)
+    // ============================================
+
+    if (field === 'history') {
+      console.log('📜 History webhook received');
+      try {
+        await handleHistoryWebhook(value, tenant._id.toString());
+        return res.sendStatus(200);
+      } catch (error) {
+        console.error('❌ Error processing history webhook:', error);
+        return res.sendStatus(200);
+      }
+    }
+
+    if (field === 'smb_app_state_sync') {
+      console.log('👥 Contacts sync webhook received');
+      try {
+        await handleContactsSyncWebhook(value, tenant._id.toString());
+        return res.sendStatus(200);
+      } catch (error) {
+        console.error('❌ Error processing contacts sync webhook:', error);
+        return res.sendStatus(200);
+      }
+    }
+
+    if (field === 'smb_message_echoes') {
+      console.log('💬 Message echo webhook received');
+      try {
+        await handleMessageEchoesWebhook(value, tenant._id.toString());
+        return res.sendStatus(200);
+      } catch (error) {
+        console.error('❌ Error processing message echo webhook:', error);
+        return res.sendStatus(200);
+      }
+    }
+
+    if (field === 'account_update') {
+      console.log('⚙️ Account update webhook received');
+      try {
+        await handleAccountUpdateWebhook(value, tenant._id.toString());
+        return res.sendStatus(200);
+      } catch (error) {
+        console.error('❌ Error processing account update webhook:', error);
+        return res.sendStatus(200);
+      }
+    }
+
+    // ============================================
+    // 2. Handle Status Updates (Blue Ticks)
+    // ============================================
+    if (value?.statuses) {
+      for (const status of value.statuses) {
+
+        // A. Handle Payment Status
+        if (status.type === 'payment') {
+          console.log('💳 Payment status webhook received');
+          try {
+            await handlePaymentStatusUpdate(status, tenant, value.metadata);
+          } catch (paymentError) {
+            console.error('❌ Error processing payment status:', paymentError);
+          }
+          continue;
+        }
+
+        // B. Handle Message Status (Sent, Delivered, Read, Failed)
+        const messageId = status.id;
+        const newStatus = status.status;
+
+        try {
+          // 1. Update Database
+          const message = await Message.findOneAndUpdate(
+            { messageId: messageId },
+            {
+              $set: {
+                status: newStatus,
+                updatedAt: new Date(),
+                // If read, capture the timestamp
+                ...(newStatus === 'read' ? { readAt: new Date() } : {})
+              }
+            },
+            { new: true }
+          );
+
+          if (message) {
+            // 2. ✅ CRITICAL FIX: Emit Real-Time Socket Event to UI
+            if (global.io) {
+              console.log(`📡 Emitting status update: ${newStatus} for ${messageId}`);
+
+              // Emit to the tenant room so all agents see the tick update
+              global.io.to(tenant._id.toString()).emit('message_status_update', {
+                messageId: message.messageId, // The ID used in frontend key
+                _id: message._id,             // MongoDB ID
+                status: newStatus,
+                phoneNumber: message.to       // Helps frontend identify contact
+              });
+            }
+
+            // 3. Handle Broadcast Logic (Existing)
+            if (message.broadcastId) {
+              await updateBroadcastStatusWithRealTimeEmit(
+                message.broadcastId,
+                messageId,
+                newStatus,
+                message.to,
+                message.tenantId
+              );
+            }
+          }
+        } catch (error) {
+          console.error(`❌ Error updating status for ${messageId}:`, error.message);
+        }
+      }
+      return res.sendStatus(200);
+    }
+
+
+    // ============================================
+    // 3. Handle System Messages (Identity Changes)
+    // ============================================
+    if (value?.messages?.[0]?.type === 'system') {
+      const systemMessage = value.messages[0];
+      const systemData = systemMessage.system;
+
+      console.log('📱 System message received:', {
+        type: systemData?.type,
+        from: systemMessage.from,
+        tenantId: tenant._id
+      });
+
+      try {
+        const newSystemMessage = new Message({
+          tenantId: tenant._id,
+          from: systemMessage.from,
+          to: value.metadata.phone_number_id,
+          messageId: systemMessage.id,
+          type: 'system',
+          systemMessage: {
+            type: systemData?.type,
+            body: systemData?.body,
+            wa_id: systemData?.wa_id,
+            identity: systemData?.identity,
+            customer: systemData?.customer
+          },
+          timestamp: new Date(parseInt(systemMessage.timestamp) * 1000),
+          status: 'received'
+        });
+
+        await newSystemMessage.save();
+
+        if (systemData?.type === 'user_changed_number' && systemData?.wa_id) {
+            await Contact.findOneAndUpdate(
+                { tenantId: tenant._id.toString(), phone_number: systemMessage.from },
+                { $set: { phone_number: systemData.wa_id, previousPhoneNumber: systemMessage.from } }
+            );
+        }
+
+        if (global.io) {
+          global.io.to(tenant._id.toString()).emit('system_message_received', {
+            message: newSystemMessage.toObject(),
+            tenantId: tenant._id
+          });
+        }
+      } catch (error) {
+        console.error('❌ Error saving system message:', error);
+      }
+      return res.sendStatus(200);
+    }
+
+
+    // ============================================
+    // 4. Handle Incoming User Messages
+    // ============================================
+    if (value?.messages?.[0]) {
+      const messageData = value.messages[0];
+      const contactData = value.contacts?.[0];
+      const metadata = value.metadata;
+
+      console.log('💬 Incoming message received:', {
+        from: messageData.from,
+        type: messageData.type,
+        tenantId: tenant._id,
+      });
+
+       // A. Create/Update Contact
+      const contact = await handleContactForWebhook(messageData, contactData, tenant);
+      const isNewContact = !contact.lastMessage || contact.createdAt.getTime() === contact.updatedAt.getTime();
+
+      // B. Save Message
+      const messageDetails = await processMessageByType(messageData, tenant, metadata);
+      const newMessage = new Message({
+        tenantId: tenant._id,
+        from: messageData.from,
+        to: metadata.phone_number_id,
+        ...messageDetails,
+        timestamp: new Date(parseInt(messageData.timestamp) * 1000),
+        messageId: messageData.id,
+        type: messageData.type,
+        status: 'received',
+      });
+      await newMessage.save();
+
+      // C. Emit to UI
+      emitMessageToSocket(tenant, newMessage, contact, metadata);
+
+        try {
+          await redisService.deletePattern(`contacts:${tenant._id}:*`);
+          await redisService.deletePattern(`contacts:counts:${tenant._id}`);
+        } catch (cacheError) {
+          console.error('Redis cache clear failed:', cacheError);
+        }
+
+      // =================================================================
+      // 🚦 TRAFFIC CONTROLLER: LOGIC ROUTING
+      // =================================================================
+
+      // ✅ PRIORITY 1: FLOW COMPLETION (nfm_reply)
+      // Determine if this is a Registration (Booking) or E-commerce Order
+      if (messageData.type === 'interactive' && messageData.interactive?.type === 'nfm_reply') {
+          try {
+              const reply = messageData.interactive.nfm_reply;
+              const responseJson = JSON.parse(reply.response_json);
+              const flowToken = responseJson.flow_token;
+
+              const FlowToken = require('../models/FlowToken');
+              const tokenRecord = await FlowToken.findOne({ token: flowToken });
+
+              console.log('🔍 Token debug:', {
+                  flowToken: flowToken?.substring(0, 12),
+                  tokenFound: !!tokenRecord,
+                  tokenFlowType: tokenRecord?.flowType,
+                  tokenConfigId: tokenRecord?.registrationConfigId
+              });
+
+              if (tokenRecord && tokenRecord.flowType === 'registration') {
+                  // ➡️ REGISTRATION FLOW
+                  console.log('🔀 Routing to Booking Automation');
+
+                  let regConfig;
+                  if (tokenRecord.registrationConfigId) {
+                      regConfig = await RegistrationConfig.findById(tokenRecord.registrationConfigId);
+                  }
+                  if (!regConfig) {
+                      regConfig = await RegistrationConfig.findOne({ tenantId: tenant._id, isActive: true });
+                  }
+
+                  if (regConfig) {
+                      await handleRegistrationFlowCompletion(messageData, tenant, metadata, regConfig, responseJson);
+                  } else {
+                      console.error('❌ Registration config not found');
+                  }
+
+              } else if (tokenRecord && tokenRecord.flowType === 'order_completion') {
+                  // ➡️ ORDER FLOW
+                  console.log('🔀 Routing to Order Automation');
+                  await handleFlowCompletionWithShipping(messageData, tenant, metadata);
+
+              } else {
+                  // ➡️ NO TOKEN FOUND - FALLBACK using response JSON fields
+                  console.log('⚠️ No token found, using fallback detection...');
+
+                  const hasRegistrationFields =
+                      responseJson.num_participants !== undefined ||
+                      responseJson.participants !== undefined;
+
+                  const hasOrderFields =
+                      responseJson.order_total !== undefined ||
+                      responseJson.address !== undefined;
+
+                  if (hasRegistrationFields) {
+                      console.log('🔀 Fallback: Routing to Registration');
+                      let regConfig = await RegistrationConfig.findOne({
+                          tenantId: tenant._id, isActive: true
+                      });
+                      if (regConfig) {
+                          await handleRegistrationFlowCompletion(messageData, tenant, metadata, regConfig, responseJson);
+                      }
+                  } else if (hasOrderFields) {
+                      console.log('🔀 Fallback: Routing to Order');
+                      await handleFlowCompletionWithShipping(messageData, tenant, metadata);
+                  } else {
+                      console.log('⚠️ Cannot determine flow type - defaulting to Order');
+                      await handleFlowCompletionWithShipping(messageData, tenant, metadata);
+                  }
+              }
+
+          } catch (flowError) {
+              console.error('❌ Error routing flow response:', flowError);
+          }
+          return res.sendStatus(200);
+        }
+
+      // ✅ PRIORITY 2: TEXT MESSAGE HANDLERS
+      if (messageData.type === 'text' && messageData.text?.body) {
+
+        // 2a. Check Registration Triggers (High Priority)
+        const RegistrationConfig = require('../models/RegistrationConfig');
+        const registrationConfig = await checkRegistrationTrigger(messageData.text.body, tenant);
+
+        if (registrationConfig) {
+          console.log('🎯 Registration Trigger Detected');
+          await sendRegistrationFlow(messageData.from, registrationConfig, tenant, metadata);
+          return res.sendStatus(200);
+        }
+
+        // 2b. Check Bot / AI / Welcome
+        const { shouldRespond, responseType } = await shouldSendBotResponse(
+          messageData,
+          tenant,
+          contact,
+          isNewContact
+        );
+
+        if (shouldRespond) {
+          switch (responseType) {
+            case 'welcome':
+              console.log('▶️ Sending Welcome Message');
+              await sendWelcomeMessage(messageData.from, tenant, metadata);
+              break;
+            case 'ai_response':
+              console.log('▶️ Sending AI Response');
+              await handleBotResponse(messageData, tenant, metadata);
+              break;
+            case 'human_agent':
+              console.log('▶️ Handling Human Agent Request');
+              await handleHumanAgentRequest(messageData, tenant, metadata);
+              break;
+          }
+        }
+      }
+
+     // ✅ PRIORITY 2b: BUTTON (template button replies like "Book Now")
+      if (messageData.type === 'button') {
+        const buttonText = messageData.button?.text || '';
+        console.log('🔘 Button message received:', buttonText);
+
+        if (buttonText) {
+          // Check registration trigger first
+          const registrationConfig = await checkRegistrationTrigger(buttonText, tenant);
+          if (registrationConfig) {
+            console.log('🎯 Registration Trigger from Button:', buttonText);
+            await sendRegistrationFlow(messageData.from, registrationConfig, tenant, metadata);
+            return res.sendStatus(200);
+          }
+
+          // Also run through bot/welcome logic
+          const fakeTextMessage = {
+            ...messageData,
+            type: 'text',
+            text: { body: buttonText }
+          };
+          const { shouldRespond, responseType } = await shouldSendBotResponse(
+            fakeTextMessage, tenant, contact, isNewContact
+          );
+          if (shouldRespond) {
+            switch (responseType) {
+              case 'welcome':
+                await sendWelcomeMessage(messageData.from, tenant, metadata);
+                break;
+              case 'ai_response':
+                await handleBotResponse(fakeTextMessage, tenant, metadata);
+                break;
+              case 'human_agent':
+                await handleHumanAgentRequest(messageData, tenant, metadata);
+                break;
+            }
+          }
+        }
+        return res.sendStatus(200);
+      }
+
+      // ✅ PRIORITY 3: INTERACTIVE (Buttons/Lists, NOT Flows)
+      if (messageData.type === 'interactive' && messageData.interactive?.type !== 'nfm_reply') {
+        console.log('▶️ Handling Interactive Button/List Response');
+        await handleInteractiveMessageResponse(messageData, tenant, metadata);
+        return res.sendStatus(200);
+      }
+
+      // ✅ PRIORITY 4: CATALOG ORDERS (Native WhatsApp Commerce)
+      if (messageData.type === 'order') {
+        console.log('▶️ Handling Catalog Order');
+
+        // =========================================================
+        // 🛒 START ABANDONED CART TIMER
+        // =========================================================
+        try {
+            // Check if we have order data from processMessageByType
+            if (messageDetails && messageDetails.orderData && messageDetails.orderData.raw_order_data) {
+                console.log(`🛒 Triggering Abandoned Cart Timer for ${messageData.from}`);
+
+                await abandonedCartService.handleIncomingCart(
+                    tenant,
+                    messageData.from,
+                    messageDetails.orderData.raw_order_data
+                );
+            } else {
+                console.warn('⚠️ Missing order data for abandoned cart trigger');
+            }
+        } catch (cartError) {
+            console.error('❌ Failed to trigger abandoned cart timer:', cartError);
+        }
+        // =========================================================
+
+        await sendOrderFlowMessage(messageDetails.orderData, messageData, tenant, metadata);
+        return res.sendStatus(200);
+      }
+
+      return res.sendStatus(200);
+    }
+
+    // If no specific webhook type matched, return 200
+    return res.sendStatus(200);
+
+  } catch (error) {
+    console.error('❌ Webhook Error:', error);
+    return res.sendStatus(500);
+  }
+});
+
+
+// Debug routes for order counter testing
+router.get('/debug-counter/:tenantId', async (req, res) => {
+  try {
+    const tenantId = req.params.tenantId;
+
+    console.log('DEBUG: Checking counter for tenant:', tenantId);
+
+    const counter = await OrderCounter.findOne({ tenantId: tenantId });
+
+    console.log('DEBUG: Counter found:', counter);
+
+    const allCounters = await OrderCounter.find({});
+
+    res.json({
+      requestedTenantId: tenantId,
+      counterExists: !!counter,
+      counter: counter,
+      allCounters: allCounters,
+      totalCounters: allCounters.length
+    });
+
+  } catch (error) {
+    console.error('Debug error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/fix-counter/:tenantId', async (req, res) => {
+  try {
+    const tenantId = req.params.tenantId;
+    const startFrom = req.body.startFrom || 1000;
+
+    console.log('FIXING: Resetting counter for tenant:', tenantId, 'to:', startFrom);
+
+    await OrderCounter.deleteMany({ tenantId: tenantId });
+
+    const newCounter = await OrderCounter.initializeTenant(tenantId, startFrom);
+
+    console.log('FIXED: Counter created:', newCounter);
+
+    res.json({
+      message: 'Counter fixed successfully',
+      tenantId: tenantId,
+      newCounter: newCounter,
+      nextOrderId: newCounter.nextOrderNumber
+    });
+
+  } catch (error) {
+    console.error('Fix error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Health check endpoint for bot functionality
+router.get('/bot-health/:tenantId', async (req, res) => {
+  try {
+    const tenantId = req.params.tenantId;
+
+    const [botStatus, botConfig, knowledgeBase, tenant] = await Promise.all([
+      BotStatus.findOne({ tenantId }),
+      BotConfiguration.findOne({ tenant_id: tenantId }),
+      require('../models/KnowledgeBase').findOne({ tenantId }),
+      Tenant.findById(tenantId)
+    ]);
+
+    const health = {
+      tenantId,
+      timestamp: new Date().toISOString(),
+      botStatus: {
+        exists: !!botStatus,
+        status: botStatus?.status || 'unknown',
+        lastUpdated: botStatus?.lastUpdated
+      },
+      botConfig: {
+        exists: !!botConfig,
+        isActive: botConfig?.isActive || false,
+        triggerWords: botConfig?.triggerWords?.length || 0,
+        workflows: botConfig?.workflows?.length || 0,
+        welcomeMessageType: botConfig?.welcomeMessageType || 'none'
+      },
+      knowledgeBase: {
+        exists: !!knowledgeBase,
+        hasKnowledgeBase: knowledgeBase?.hasKnowledgeBase || false,
+        chunksCount: knowledgeBase?.chunksCount || 0,
+        embeddingsCount: knowledgeBase?.vectors?.filter(v => v.embedding?.length > 0).length || 0
+      },
+      tenant: {
+        exists: !!tenant,
+        hasWhatsAppConfig: !!(tenant?.whatsappConfig?.accessToken),
+        name: tenant?.name || 'Unknown'
+      },
+      overall: 'unknown'
+    };
+
+    // Determine overall health
+    if (health.botStatus.status === 'online' &&
+      health.botConfig.isActive &&
+      health.knowledgeBase.hasKnowledgeBase &&
+      health.tenant.hasWhatsAppConfig) {
+      health.overall = 'healthy';
+    } else if (health.botStatus.exists && health.botConfig.exists) {
+      health.overall = 'partial';
+    } else {
+      health.overall = 'unhealthy';
+    }
+
+    // Add recommendations
+    health.recommendations = [];
+    if (!health.botStatus.exists) {
+      health.recommendations.push('Create bot status entry');
+    } else if (health.botStatus.status !== 'online') {
+      health.recommendations.push('Turn on bot status');
+    }
+
+    if (!health.botConfig.exists) {
+      health.recommendations.push('Create bot configuration');
+    } else if (!health.botConfig.isActive) {
+      health.recommendations.push('Activate bot configuration');
+    }
+
+    if (!health.knowledgeBase.hasKnowledgeBase) {
+      health.recommendations.push('Upload knowledge base file');
+    }
+
+    if (!health.tenant.hasWhatsAppConfig) {
+      health.recommendations.push('Configure WhatsApp access token');
+    }
+
+    res.json(health);
+
+  } catch (error) {
+    res.status(500).json({
+      error: error.message,
+      tenantId: req.params.tenantId,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+async function sendRegistrationFlow(phoneNumber, registrationConfig, tenant, metadata) {
+  try {
+    console.log('📋 Sending registration flow:', {
+      phoneNumber,
+      flowId: registrationConfig.registrationFlowId,
+      tenantId: tenant._id
+    });
+
+    const WhatsAppService = require('../services/whatsappServices');
+    const whatsappService = new WhatsAppService(tenant);
+    const FlowToken = require('../models/FlowToken');
+    const crypto = require('crypto');
+
+    // Generate unique flow token
+    const flowToken = crypto.randomBytes(32).toString('hex');
+
+    // ✅ Use tenant-specific flow message content
+    const flowPayload = {
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: phoneNumber,
+      type: 'interactive',
+      interactive: {
+        type: 'flow',
+        header: {
+          type: 'text',
+          text: registrationConfig.flowMessage?.header || '📝 Business Registration'
+        },
+        body: {
+          text: registrationConfig.flowMessage?.body || 'Please fill out the registration form to complete your registration.'
+        },
+        footer: {
+          text: registrationConfig.flowMessage?.footer || 'Powered by GoWhats!'
+        },
+        action: {
+          name: 'flow',
+          parameters: {
+            flow_message_version: '3',
+            flow_id: registrationConfig.registrationFlowId,
+            flow_token: flowToken,
+            flow_cta: registrationConfig.flowMessage?.ctaButtonText || 'Start Registration',
+            mode: 'published',
+            flow_action: 'navigate',
+            flow_action_payload: {
+              screen: 'REGISTRATION',
+              data: {
+                registration_fee: registrationConfig.registrationFee || 0,
+                business_activities: [
+                  { id: 'retail', title: 'Retail' },
+                  { id: 'services', title: 'Services' },
+                  { id: 'manufacturing', title: 'Manufacturing' },
+                  { id: 'food', title: 'Food & Beverage' },
+                  { id: 'technology', title: 'Technology' },
+                  { id: 'healthcare', title: 'Healthcare' },
+                  { id: 'ecommerce', title: 'Ecommerce' },
+                  { id: 'education', title: 'Education' },
+                  { id: 'construction', title: 'Construction' },
+                  { id: 'transportation', title: 'Transportation' },
+                  { id: 'other', title: 'Other' }
+                ],
+                struggles: [
+                  { id: 'customers', title: 'Customer Management' },
+                  { id: 'inventory', title: 'Inventory Management' },
+                  { id: 'payments', title: 'Payment Collection' },
+                  { id: 'marketing', title: 'Digital Marketing' },
+                  { id: 'communication', title: 'Communication' },
+                  { id: 'time', title: 'Time Management' },
+                  { id: 'staff', title: 'Staff Management' },
+                  { id: 'accounting', title: 'Accounting' },
+                  { id: 'other', title: 'Other' }
+                ],
+                tech_solutions: [
+                  { id: 'crm', title: 'CRM System' },
+                  { id: 'whatsapp', title: 'WhatsApp Automation' },
+                  { id: 'instagram', title: 'Instagram Automation' },
+                  { id: 'ecommerce', title: 'Website Development' },
+                  { id: 'inventory', title: 'Inventory Software' },
+                  { id: 'payment', title: 'Payment Solutions' },
+                  { id: 'marketing', title: 'Digital Marketing' },
+                  { id: 'accounting', title: 'Accounting' },
+                  { id: 'not_sure', title: 'Not Sure' }
+                ]
+              }
+            }
+          }
+        }
+      }
+    };
+
+    console.log('📤 Sending registration flow payload with custom content:', {
+      header: flowPayload.interactive.header.text,
+      bodyPreview: flowPayload.interactive.body.text.substring(0, 50) + '...',
+      footer: flowPayload.interactive.footer.text,
+      ctaButton: flowPayload.interactive.action.parameters.flow_cta
+    });
+
+    // Send flow message via WhatsApp
+    const axios = require('axios');
+    const response = await axios.post(
+      `${whatsappService.baseUrl}/${whatsappService.phoneNumberId}/messages`,
+      flowPayload,
+      {
+        headers: {
+          Authorization: `Bearer ${whatsappService.accessToken}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 30000
+      }
+    );
+
+    if (response) {
+      console.log('✅ Registration flow sent successfully:', {
+        messageId: response.data.messages?.[0]?.id
+      });
+
+      // Store flow token with registration context
+      await FlowToken.create({
+        tenantId: tenant._id.toString(),
+        token: flowToken,
+        flowId: registrationConfig.registrationFlowId,
+        phoneNumber: phoneNumber,
+        flowType: 'registration',
+        registrationConfigId: registrationConfig._id,
+        status: 'active',
+        createdAt: new Date()
+      });
+
+      // Save message to database
+      const Message = require('../models/Message');
+      const registrationFlowMessage = new Message({
+        tenantId: tenant._id,
+        from: metadata?.phone_number_id || tenant.whatsappConfig?.phoneNumberId || 'system',
+        to: phoneNumber,
+        text: 'Registration form sent',
+        type: 'interactive',
+        subType: 'registration_flow',
+        timestamp: new Date(),
+        messageId: response.data.messages?.[0]?.id,
+        status: 'sent',
+        isAutomatedMessage: true,
+        flowId: registrationConfig.registrationFlowId,
+        flowToken: flowToken
+      });
+
+      await registrationFlowMessage.save();
+
+      // Emit to socket for real-time UI update
+      if (global.io) {
+        global.io.to(tenant._id.toString()).emit('message_sent', {
+          ...registrationFlowMessage.toObject(),
+          contact: { phone_number: phoneNumber }
+        });
+      }
+
+      // Increment registration count
+      await registrationConfig.incrementRegistrationCount();
+
+      return response.data;
+    }
+
+    console.error('❌ No response from WhatsApp API');
+    return null;
+
+  } catch (error) {
+    console.error('❌ Error sending registration flow:', {
+      error: error.message,
+      response: error.response?.data,
+      phoneNumber: phoneNumber,
+      tenantId: tenant._id
+    });
+    throw error;
+  }
+}
+
+/**
+ * Handle registration flow completion with proper payment logic
+ */
+
+async function handleRegistrationFlowCompletion(messageData, tenant, metadata, registrationConfig, responseJson) {
+  try {
+    console.log('✅ ====== REGISTRATION FLOW COMPLETION ======');
+
+    // 1. Parse Data
+    const registrationData = responseJson || JSON.parse(messageData.interactive.nfm_reply.response_json);
+    console.log('📋 Raw Registration Data:', JSON.stringify(registrationData));
+
+    // 2. ✅ FIX: Determine Participant Count with SMART FIELD DETECTION
+    let participantCount = 1;
+
+    const participantFields = [
+      'participants',
+      'participant_count',
+      'num_participants',
+      'number_of_participants',
+      'pax',
+      'people',
+      'count',
+      'total_participants'
+    ];
+
+    for (const field of participantFields) {
+      if (registrationData[field]) {
+        const value = parseInt(registrationData[field], 10);
+        if (!isNaN(value) && value > 0 && value < 100) {
+          participantCount = value;
+          console.log(`✅ Participant count found in field "${field}": ${participantCount}`);
+          break;
+        }
+      }
+    }
+
+    if (participantCount > 99) {
+      console.warn(`⚠️ Suspicious participant count (${participantCount}), resetting to 1`);
+      participantCount = 1;
+    }
+
+    console.log(`👥 FINAL Participant Count: ${participantCount}`);
+
+    // 3. Calculate Amount
+    const feePerTicket = registrationConfig.registrationFee || 0;
+    const totalAmount = feePerTicket * participantCount;
+
+    // ✅ NEW: Get currency based on gateway
+    const currency = registrationConfig.paymentGateway === 'stripe' ? 'SGD' : 'INR';
+    const currencySymbol = registrationConfig.paymentGateway === 'stripe' ? 'S$' : '₹';
+
+    console.log('💰 Payment Calculation:', {
+      feePerTicket,
+      participantCount,
+      totalAmount,
+      currency: currency, // ✅ LOG CURRENCY
+      gateway: registrationConfig.paymentGateway
+    });
+
+    // Smart Gateway Selection
+    let paymentGateway = registrationConfig.paymentGateway || 'razorpay';
+    if (registrationConfig.stripeConfig && registrationConfig.stripeConfig.enabled === true) {
+        paymentGateway = 'stripe';
+    }
+
+    // ============================================================
+    // 🔄 ORDER CREATION WITH RETRY LOGIC
+    // ============================================================
+    const { generateOrderId } = require('../utils/orderUtils');
+    const Order = require('../models/Order');
+
+    let newRegistrationOrder;
+    let orderId;
+    let savedSuccessfully = false;
+    let attempts = 0;
+    const MAX_RETRIES = 3;
+
+    while (!savedSuccessfully && attempts < MAX_RETRIES) {
+        attempts++;
+        try {
+            const rawId = await generateOrderId(tenant._id.toString());
+            const prefix = registrationConfig.ticketConfig?.prefix || '';
+            orderId = prefix ? `${prefix}${rawId}` : rawId;
+
+            console.log(`🆔 Generated Ticket ID (Attempt ${attempts}): ${orderId}`);
+
+            newRegistrationOrder = new Order({
+              tenantId: tenant._id.toString(),
+              orderId: orderId,
+              orderNumber: rawId,
+              customerPhone: messageData.from,
+              customerDetails: {
+                name: registrationData.name || 'Valued Guest',
+                phone: messageData.from,
+                email: registrationData.email || null
+              },
+              registrationDetails: registrationData,
+              orderAmount: feePerTicket,
+              totalAmount: totalAmount,
+              currency: currency, // ✅ DYNAMIC CURRENCY
+              status: 'pending',
+              paymentStatus: 'pending',
+              source: 'registration_flow',
+              participantCount: participantCount,
+              metadata: {
+                messageId: messageData.id,
+                flowCompletedAt: new Date(),
+                registrationConfigId: registrationConfig._id,
+                participantCount: participantCount,
+                paymentGateway: paymentGateway,
+                isRegistrationOrder: true,
+                feePerPerson: feePerTicket,
+                currency: currency // ✅ STORE CURRENCY IN METADATA
+              }
+            });
+
+            await newRegistrationOrder.save();
+            savedSuccessfully = true;
+            console.log(`📝 Order Saved Successfully: ${orderId} (${participantCount} participants, Total: ${currency} ${totalAmount})`);
+
+        } catch (saveError) {
+            if (saveError.code === 11000) {
+                console.warn(`⚠️ Duplicate Order ID ${orderId} detected. Retrying...`);
+                await new Promise(resolve => setTimeout(resolve, 500));
+            } else {
+                throw saveError;
+            }
+        }
+    }
+
+    if (!savedSuccessfully) {
+        throw new Error(`Failed to generate unique Order ID after ${MAX_RETRIES} attempts`);
+    }
+
+    // 4. Handle Flow Token
+    const FlowToken = require('../models/FlowToken');
+    if (registrationData.flow_token) {
+      await FlowToken.markAsUsed(tenant._id.toString(), registrationData.flow_token, registrationData, orderId);
+    }
+
+    // ============================================================
+    // 🚦 PAYMENT LOGIC
+    // ============================================================
+    const Settings = require('../models/settings');
+    const globalSettings = await Settings.findOne({ tenant_id: tenant._id.toString() });
+
+    const isGlobalPaymentEnabled = globalSettings?.automationConfig?.paymentRequest?.enabled !== false;
+    const isEventPaymentRequired = registrationConfig.paymentRequired === true || registrationConfig.paymentRequired === "true";
+
+    console.log(`🔍 Payment Checks: Global=${isGlobalPaymentEnabled}, Event=${isEventPaymentRequired}, Amount=${totalAmount}, Pax=${participantCount}`);
+
+    if (isGlobalPaymentEnabled && isEventPaymentRequired && totalAmount > 0) {
+
+      console.log(`💳 Payment Required. Sending ${paymentGateway.toUpperCase()} link for ${participantCount} pax in ${currency}...`);
+
+      if (paymentGateway === 'stripe') {
+        console.log('💳 Route: STRIPE Payment Link');
+        await sendStripePaymentLink(
+          messageData.from,
+          registrationData,
+          registrationConfig,
+          tenant,
+          metadata,
+          orderId,
+          totalAmount,
+          participantCount,
+          currency
+        );
+
+      } else {
+        console.log('💳 Route: RAZORPAY Native Flow');
+        await sendRegistrationPaymentFlow(
+          messageData.from,
+          registrationData,
+          registrationConfig,
+          tenant,
+          metadata,
+          orderId,
+          totalAmount,
+          participantCount
+        );
+      }
+
+    } else {
+      // ✅ FREE FLOW - Generate tickets immediately
+      console.log('🎟️ Route: Payment Skipped (Free or Disabled). Generating Tickets...');
+
+      const ticketsGenerated = await generateAndSendMultipleTickets(
+        tenant,
+        messageData.from,
+        participantCount,
+        registrationConfig,
+        registrationData.name || 'Guest',
+        registrationData,
+        orderId
+      );
+
+      if (ticketsGenerated) {
+        newRegistrationOrder.metadata.ticketsGenerated = true;
+        newRegistrationOrder.metadata.ticketsGeneratedAt = new Date();
+        newRegistrationOrder.status = 'confirmed';
+        newRegistrationOrder.paymentStatus = 'completed';
+        await newRegistrationOrder.save();
+      }
+      await registrationConfig.incrementRegistrationCount();
+    }
+
+    // 5. Emit Event
+    if (global.io) {
+      global.io.to(tenant._id.toString()).emit('registration_completed', {
+        phoneNumber: messageData.from,
+        orderId: orderId,
+        amount: totalAmount,
+        participantCount: participantCount,
+        currency: currency, // ✅ EMIT CURRENCY
+        gateway: paymentGateway,
+        tenantId: tenant._id
+      });
+    }
+
+    console.log('✅ ====== REGISTRATION FLOW COMPLETED SUCCESSFULLY ======');
+
+  } catch (error) {
+    console.error('❌ CRITICAL ERROR in Registration Flow:', error);
+    try {
+        const WhatsAppService = require('../services/whatsappServices');
+        const ws = new WhatsAppService(tenant);
+        await ws.sendMessage(messageData.from, "We received your details but encountered a system error. Our team has been notified.");
+    } catch(e) {}
+  }
+}
+
+/**
+ * Send Stripe Payment Link via WhatsApp
+ */
+async function sendStripePaymentLink(phoneNumber, registrationData, registrationConfig, tenant, metadata, orderId, totalAmount, participantCount, currency) {
+  try {
+    const stripeService = require('../services/stripeService');
+    const WhatsAppService = require('../services/whatsappServices');
+    const whatsappService = new WhatsAppService(tenant);
+    const axios = require('axios');
+
+    const customerName = registrationData.name || 'Customer';
+
+    // ✅ FIX: Auto-determine currency based on gateway
+    const currency = registrationConfig.paymentGateway === 'stripe' ? 'SGD' : 'INR';
+    const currencySymbol = registrationConfig.paymentGateway === 'stripe' ? 'S$' : '₹';
+
+    // ✅ Safety check: Recalculate if needed
+    let finalAmount = totalAmount;
+    if (!finalAmount || finalAmount === 0) {
+      const feePerTicket = registrationConfig.registrationFee || 0;
+      const paxCount = participantCount || 1;
+      finalAmount = feePerTicket * paxCount;
+      console.log(`⚠️ Total amount recalculated: ${feePerTicket} × ${paxCount} = ${finalAmount}`);
+    }
+
+    console.log('💳 Stripe Payment Details:', {
+      orderId,
+      participantCount,
+      feePerTicket: registrationConfig.registrationFee,
+      finalAmount,
+      currency: currency // ✅ DYNAMIC CURRENCY
+    });
+
+    // 1. Generate Link with DYNAMIC CURRENCY
+
+	    const paymentLink = await stripeService.createPaymentLink({
+	  amount: stripeService.toCents(finalAmount),
+	  currency: currency.toLowerCase(),
+	  orderId: orderId,           // ✅ top level
+	  customerName: customerName,
+	  customerEmail: registrationData.email,
+	  customerPhone: phoneNumber,
+	  description: `Event Registration - ${participantCount} Participants`,
+	  metadata: {
+	    orderId: orderId,                                          // ✅ must be here
+	    tenantId: tenant._id.toString(),                          // ✅ must be here
+	    registrationConfigId: registrationConfig._id.toString(),  // ✅ must be here
+	    participantCount: participantCount.toString(),
+	    isRegistrationOrder: "true",
+	    feePerPerson: registrationConfig.registrationFee.toString(),
+	    currency: currency
+	  }
+	});
+
+    console.log('✅ Stripe Link Created:', {
+      url: paymentLink.url,
+      amount: `${currency} ${finalAmount.toFixed(2)}`, // ✅ DYNAMIC CURRENCY
+      participants: participantCount
+    });
+
+    // 2. Prepare Button Message with DYNAMIC CURRENCY
+    const headerText = registrationConfig.paymentMessage?.header || '💳 Payment Request';
+    const bodyText = `${registrationConfig.paymentMessage?.body || 'Please complete your payment.'}\n\n` +
+                 `📄 *Booking ID:* ${orderId}\n` +
+                 `👥 *Participants:* ${participantCount}\n` +
+                 `🎟️ *Fee per Person:* ${currencySymbol} ${registrationConfig.registrationFee.toFixed(2)}\n` +
+                 `✖️ *No. of Tickets:* ${participantCount}\n` +
+                 `━━━━━━━━━━━━━━\n` +
+                 `💰 *Total Amount:* ${currencySymbol} ${finalAmount.toFixed(2)}\n\n` +
+                 `Click below to complete your payment.`;
+
+    const messagePayload = {
+      messaging_product: "whatsapp",
+      recipient_type: "individual",
+      to: phoneNumber,
+      type: "interactive",
+      interactive: {
+        type: "cta_url",
+        header: { type: "text", text: headerText.substring(0, 60) },
+        body: { text: bodyText.substring(0, 1024) },
+        footer: { text: "Secure Payment via Stripe" },
+        action: {
+          name: "cta_url",
+          parameters: {
+            display_text: "Pay Now",
+            url: paymentLink.url
+          }
+        }
+      }
+    };
+
+    // 3. Send
+    console.log('📤 Sending Stripe CTA Button...');
+    const response = await axios.post(
+      `${whatsappService.baseUrl}/${whatsappService.phoneNumberId}/messages`,
+      messagePayload,
+      { headers: { Authorization: `Bearer ${whatsappService.accessToken}`, 'Content-Type': 'application/json' } }
+    );
+
+    // 4. Log
+    if (response.data) {
+      const Message = require('../models/Message');
+      await Message.create({
+        tenantId: tenant._id,
+        from: metadata?.phone_number_id,
+        to: phoneNumber,
+        text: `Stripe Link Sent: ${currencySymbol} ${finalAmount.toFixed(2)} for ${participantCount} participant(s)`,
+        type: 'interactive',
+        status: 'sent',
+        isAutomatedMessage: true,
+        orderId: orderId,
+        paymentGateway: 'stripe',
+        messageId: response.data.messages?.[0]?.id
+      });
+
+      console.log('✅ Payment link message saved to DB');
+    }
+    return response.data;
+
+  } catch (error) {
+    console.error('❌ Error sending Stripe link:', error.message);
+    // Fallback
+    try {
+        const ws = new WhatsAppService(tenant);
+        const currency = registrationConfig.paymentGateway === 'stripe' ? 'SGD' : 'INR';
+        const currencySymbol = registrationConfig.paymentGateway === 'stripe' ? 'S$' : '₹';
+        await ws.sendMessage(phoneNumber, `Payment Link: ${paymentLink.url}\nAmount: ${currencySymbol}${totalAmount} for ${participantCount} participant(s)`);
+    } catch(e) {}
+  }
+}
+
+/**
+ * Send payment flow for registration
+ */
+async function sendRegistrationPaymentFlow(phoneNumber, registrationData, registrationConfig, tenant, metadata, orderId, totalAmount, participantCount) {
+  try {
+    console.log(`💳 ====== SENDING REGISTRATION PAYMENT FLOW (RAZORPAY) ======`);
+    console.log(`💰 Total: ${totalAmount}, Pax: ${participantCount}`);
+
+    const WhatsAppService = require('../services/whatsappServices');
+    const whatsappService = new WhatsAppService(tenant);
+
+    const customerName = registrationData.name || 'Customer';
+
+    // ✅ NEW: Get currency (always INR for Razorpay)
+    const currency = 'INR';
+    const currencySymbol = '₹';
+
+    // 1. Resolve Configuration Name
+    let razorpayConfigName = registrationConfig.paymentConfigurationName;
+
+    if (!razorpayConfigName) {
+        const Settings = require('../models/settings');
+        const globalSettings = await Settings.findOne({ tenant_id: tenant._id.toString() });
+
+        razorpayConfigName = globalSettings?.flowConfig?.paymentConfigurationName ||
+                             globalSettings?.automationConfig?.paymentRequest?.paymentConfigurationName;
+    }
+
+    if (!razorpayConfigName) {
+        throw new Error('❌ Payment Failed: Razorpay Configuration Name is missing.');
+    }
+
+    // 2. Calculate Unit Price
+    const count = Math.max(1, parseInt(participantCount));
+    const unitPrice = totalAmount / count;
+
+    // 3. Build Payment Payload
+    const paymentOrderPayload = {
+      reference_id: String(orderId),
+      type: 'digital-goods',
+      currency: currency, // ✅ DYNAMIC (but always INR for Razorpay)
+      total_amount: {
+        value: Math.round(totalAmount * 100),
+        offset: 100
+      },
+      payment_settings: [{
+        type: 'payment_gateway',
+        payment_gateway: {
+          type: 'razorpay',
+          configuration_name: razorpayConfigName,
+          razorpay: {
+            receipt: String(orderId),
+            notes: {
+              type: 'registration',
+              order_id: String(orderId),
+              customer_name: customerName,
+              tenant_id: tenant._id.toString(),
+              participant_count: String(count),
+              currency: currency // ✅ STORE CURRENCY
+            }
+          }
+        }
+      }],
+      order: {
+        status: 'pending',
+        items: [{
+          name: 'Event Ticket',
+          amount: {
+              value: Math.round(unitPrice * 100),
+              offset: 100
+          },
+          quantity: count
+        }],
+        subtotal: {
+            value: Math.round(totalAmount * 100),
+            offset: 100
+        }
+      }
+    };
+
+    const paymentMessageConfig = {
+      header: registrationConfig.paymentMessage?.header || '💳 Complete Payment',
+      body: registrationConfig.paymentMessage?.body || `Please pay ${currencySymbol}${totalAmount} for ${count} ticket(s).`,
+      footer: registrationConfig.paymentMessage?.footer || 'Secure Payment'
+    };
+
+    // 4. Send Message
+    const paymentResponse = await whatsappService.sendPaymentOrderDetails(
+      phoneNumber,
+      paymentOrderPayload,
+      paymentMessageConfig
+    );
+
+    if (paymentResponse) {
+      console.log('✅ Razorpay payment flow sent successfully');
+
+      const Message = require('../models/Message');
+      await Message.create({
+        tenantId: tenant._id,
+        from: metadata?.phone_number_id,
+        to: phoneNumber,
+        text: `Razorpay Link Sent: ${currencySymbol}${totalAmount} for ${count} pax`,
+        type: 'interactive',
+        subType: 'registration_payment',
+        timestamp: new Date(),
+        messageId: paymentResponse.messages?.[0]?.id,
+        status: 'sent',
+        isAutomatedMessage: true,
+        orderId: orderId
+      });
+    }
+    return paymentResponse;
+
+  } catch (error) {
+    console.error('❌ Error sending Razorpay flow:', error);
+    throw error;
+  }
+}
+
+
+/**
+ * Send registration confirmation after successful payment
+ */
+async function sendRegistrationConfirmation(phoneNumber, paymentData, registrationConfig, tenant, metadata) {
+  try {
+    console.log('🎉 Sending registration confirmation');
+
+    const WhatsAppService = require('../services/whatsappServices');
+    const whatsappService = new WhatsAppService(tenant);
+
+    // Use custom confirmation message from config
+    const confirmationText = registrationConfig.confirmationMessage;
+
+    const response = await whatsappService.sendMessage(phoneNumber, confirmationText);
+
+    if (response) {
+      console.log('✅ Registration confirmation sent successfully');
+
+      // Save confirmation message
+      const Message = require('../models/Message');
+      const confirmationMessage = new Message({
+        tenantId: tenant._id,
+        from: metadata?.phone_number_id || tenant.whatsappConfig?.phoneNumberId || 'system',
+        to: phoneNumber,
+        text: confirmationText,
+        type: 'text',
+        timestamp: new Date(),
+        messageId: response.messages?.[0]?.id,
+        status: 'sent',
+        isAutomatedMessage: true,
+        isRegistrationConfirmation: true
+      });
+
+      await confirmationMessage.save();
+
+      // Emit to socket
+      if (global.io) {
+        global.io.to(tenant._id.toString()).emit('message_sent', {
+          ...confirmationMessage.toObject(),
+          contact: { phone_number: phoneNumber }
+        });
+
+        // Emit registration completion event
+        global.io.to(tenant._id.toString()).emit('registration_completed', {
+          phoneNumber: phoneNumber,
+          paymentData: paymentData,
+          timestamp: new Date(),
+          tenantId: tenant._id
+        });
+      }
+
+      // Increment payment count
+      await registrationConfig.incrementPaymentCount();
+
+      return response;
+    }
+
+  } catch (error) {
+    console.error('❌ Error sending registration confirmation:', error);
+    throw error;
+  }
+}
+
+async function generateAndSendTicketQR(ticket, tenant, phoneNumber, confirmationMessage, participantCount = 1, config = null) {
+  try {
+    console.log(`🎟️ Generating Master QR for Order: ${ticket.orderId} (Count: ${participantCount})`    );
+
+    // ✅ PAYLOAD: Includes 'cnt' (count) so scanner knows total pax
+    const qrPayload = JSON.stringify({
+      oid: ticket.orderId,      // Order ID
+      tid: ticket.ticketId,     // Main Ticket ID
+      cnt: participantCount,    // ✅ Count for Scanner
+      ph: phoneNumber,
+      t_id: tenant._id.toString()
+    });
+
+    // Generate QR Buffer
+    const qrBuffer = await QRCode.toBuffer(qrPayload, {
+      errorCorrectionLevel: 'M',
+      type: 'png',
+      width: 400,
+      margin: 2,
+      color: { dark: '#000000', light: '#ffffff' }
+    });
+
+    const whatsappService = new WhatsAppService(tenant);
+
+    // Upload QR to WhatsApp
+    const uploadResult = await whatsappService.uploadMediaFile({
+      buffer: qrBuffer,
+      originalname: `ticket-${ticket.orderId}.png`,
+      mimetype: 'image/png'
+    }, 'image');
+
+    // Create Caption
+    const feePerPerson = config?.registrationFee || 0;
+    const totalFee = feePerPerson * participantCount;
+    const currencySymbol = config?.paymentGateway === 'stripe' ? 'S$' : '₹';
+
+  let processedMessage = confirmationMessage
+  .replace(/{count}/g, participantCount)
+  .replace(/{total}/g, `${currencySymbol}${totalFee.toFixed(2)}`)
+  .replace(/{fee}/g, `${currencySymbol}${feePerPerson.toFixed(2)}`)
+  .replace(/{ticketId}/g, ticket.ticketId)
+  .replace(/{name}/g, ticket.customerName || 'Guest');
+
+let caption = `${processedMessage}\n\n`;
+caption += `👥 *Admit:* ${participantCount} Person(s)\n`;
+caption += `🆔 *Ticket Ref:* ${ticket.ticketId}`;
+caption += `\n\n_Show this single QR code at the entrance for the whole group._`;
+
+    // Send the Media Message
+    await whatsappService.sendMediaMessage(
+      phoneNumber,
+      'image',
+      { id: uploadResult.id },
+      caption
+    );
+
+    // Save QR string to DB for reference
+    ticket.qrCodeString = qrPayload;
+    await ticket.save();
+
+    return true;
+
+  } catch (error) {
+    console.error('❌ Error generating/sending QR:', error);
+    // Fallback text
+    try {
+        const whatsappService = new WhatsAppService(tenant);
+        await whatsappService.sendMessage(phoneNumber, `${confirmationMessage}\n\n(QR Failed, Order ID: ${ticket.orderId}, Admit: ${participantCount})`);
+    } catch(e) {}
+    return false;
+  }
+}
+
+
+async function handleDynamicRegistrationCompletion(messageData, tenant, metadata, config, flowData) {
+  try {
+    console.log('📝 Processing Dynamic Registration Flow...');
+
+    const mapping = config.fieldMapping || {};
+    const customerName = flowData[mapping.customerName] || flowData.name || 'Valued Guest';
+
+    // ✅ FIX: Get Participant Count with detailed logging
+    let participantCount = 1;
+
+    if (mapping.participants && flowData[mapping.participants]) {
+      participantCount = parseInt(flowData[mapping.participants], 10) || 1;
+      console.log(`👥 Participant Count from Mapping: ${participantCount}`);
+    } else if (flowData.participants) {
+      participantCount = parseInt(flowData.participants, 10) || 1;
+      console.log(`👥 Participant Count from flowData.participants: ${participantCount}`);
+    } else if (flowData.count) {
+      participantCount = parseInt(flowData.count, 10) || 1;
+      console.log(`👥 Participant Count from flowData.count: ${participantCount}`);
+    }
+
+    console.log(`👥 FINAL Participant Count Detected: ${participantCount}`);
+
+    const totalAmount = config.registrationFee * participantCount;
+
+    console.log(`💰 Registration Fee per Person: ₹${config.registrationFee}`);
+    console.log(`💰 Total Amount: ₹${totalAmount} (${participantCount} × ₹${config.registrationFee})`);
+
+    // ✅ Generate Order ID at top level
+    const registrationOrderId = await config.generateNextTicketId();
+    console.log(`✅ Generated Registration Order ID: ${registrationOrderId}`);
+
+    // Check Payment Requirements
+    if ((config.paymentRequired === true || config.paymentRequired === "true") &&
+        totalAmount > 0 &&
+        !!config.paymentConfigurationName) {
+
+      console.log(`💳 Payment Required. Sending Link for ₹${totalAmount}`);
+
+      const Order = require('../models/Order');
+
+      // ✅ CRITICAL FIX: Create order with participantCount in metadata
+      const newOrder = new Order({
+        tenantId: tenant._id.toString(),
+        orderId: registrationOrderId,
+        orderNumber: registrationOrderId,
+        customerPhone: messageData.from,
+        customerDetails: {
+          name: customerName,
+          phone: messageData.from
+        },
+        orderAmount: config.registrationFee,
+        totalAmount: totalAmount,
+        currency: 'INR',
+        status: 'pending',
+        paymentStatus: 'pending',
+        source: 'registration_flow',
+        registrationDetails: flowData,
+        // ✅ FIX: Store participant count at TOP LEVEL (not in metadata)
+        participantCount: participantCount,  // ✅ Store here for easy access!
+        metadata: {
+          participantCount: participantCount, // ✅ Also store in metadata for redundancy
+          registrationConfigId: config._id,
+          isRegistrationOrder: true,
+          ticketPrefix: config.ticketConfig?.prefix || 'REG',
+          customerName: customerName,
+          totalPax: participantCount
+        }
+      });
+
+      console.log('🔍 Order object before save:', {
+        orderId: newOrder.orderId,
+        participantCount: newOrder.participantCount,
+        metadata: newOrder.metadata
+      });
+
+      await newOrder.save();
+
+      console.log(`📝 Registration Order Saved: ${registrationOrderId}`);
+      console.log(`📊 Order Participant Count (Top Level): ${newOrder.participantCount}`);
+      console.log(`📊 Order Metadata - Participant Count: ${newOrder.metadata?.participantCount}`);
+
+      // Prepare Payment Payload
+      const paymentPayload = {
+        reference_id: String(registrationOrderId),
+        type: 'digital-goods',
+        currency: 'INR',
+        total_amount: { value: Math.round(totalAmount * 100), offset: 100 },
+        payment_settings: [{
+          type: 'payment_gateway',
+          payment_gateway: {
+            type: 'razorpay',
+            configuration_name: config.paymentConfigurationName,
+            razorpay: {
+              receipt: String(registrationOrderId),
+              notes: {
+                order_id: String(registrationOrderId),
+                tenant_id: tenant._id.toString(),
+                type: "registration",
+                participant_count: String(participantCount), // ✅ Store in payment notes too
+                registration_config_id: String(config._id)
+              }
+            }
+          }
+        }],
+        order: {
+          status: 'pending',
+          items: [{
+            name: participantCount > 1
+              ? `Event Registration (${participantCount} Pax)`
+              : 'Event Registration',
+            amount: { value: Math.round(totalAmount * 100), offset: 100 },
+            quantity: 1
+          }],
+          subtotal: { value: Math.round(totalAmount * 100), offset: 100 }
+        }
+      };
+
+      const WhatsAppService = require('../services/whatsappServices');
+      const whatsappService = new WhatsAppService(tenant);
+
+      await whatsappService.sendPaymentOrderDetails(
+        messageData.from,
+        paymentPayload,
+        config.paymentMessage
+      );
+
+      console.log('✅ Registration payment link sent');
+      console.log(`🎫 Payment link includes ${participantCount} participant(s)`);
+
+    } else {
+      // Free/No Payment Logic
+      console.log(`🎟️ No payment required. Generating tickets...`);
+
+      await generateAndSendMultipleTickets(
+        tenant,
+        messageData.from,
+        participantCount,
+        config,
+        customerName,
+        flowData,
+        registrationOrderId
+      );
+    }
+
+    await config.incrementRegistrationCount();
+
+    if (global.io) {
+      global.io.to(tenant._id.toString()).emit('registration_new', {
+        customerName,
+        count: participantCount,
+        orderId: registrationOrderId,
+        amount: totalAmount
+      });
+    }
+
+    console.log('✅ ====== REGISTRATION FLOW COMPLETED SUCCESSFULLY ======');
+
+  } catch (error) {
+    console.error('❌ Dynamic Registration Logic Error:', error);
+  }
+}
+
+async function generateAndSendMultipleTickets(tenant, phoneNumber, count, config, customerName, flowData, orderId = null) {
+  try {
+    console.log(`🎟️ ====== TICKET GENERATION START (Count: ${count}) ======`);
+
+    // 1. Lock to prevent duplicates
+    const processingKey = `${tenant._id}-${orderId || phoneNumber}`;
+    if (processingTickets.has(processingKey)) {
+      return false; // Already processing
+    }
+    processingTickets.set(processingKey, Date.now());
+
+    // Auto-clear lock
+    setTimeout(() => { if (processingTickets.has(processingKey)) processingTickets.delete(processingKey); }, 60000);
+
+    const createdTickets = [];
+
+    // 2. Create individual database records (for backend reporting)
+    // We do this loop purely for DB, NOT for sending messages
+    for (let i = 0; i < count; i++) {
+      let ticketId = await config.generateNextTicketId();
+
+      const newTicket = new EventTicket({
+        tenantId: tenant._id.toString(),
+        ticketId: ticketId,
+        orderId: orderId,
+        customerPhone: phoneNumber,
+        customerName: count > 1 ? `${customerName} (Guest ${i + 1})` : customerName,
+        participantCount: 1, // Each DB entry represents 1 person slot
+        flowData: flowData,
+        status: 'active'
+      });
+
+      await newTicket.save();
+      createdTickets.push(newTicket);
+    }
+
+    if (createdTickets.length === 0) {
+      throw new Error("Failed to create ticket records");
+    }
+
+    // 3. ✅ SEND ONLY ONE MASTER QR CODE
+    // We use the first ticket as the reference, but mark the count in the QR payload
+    const mainTicket = createdTickets[0];
+    let confirmationMessage = config.confirmationMessage || "🎉 Booking Confirmed!";
+
+    console.log(`  📤 Sending GROUP QR code for Order ${orderId}...`);
+
+    // Call the QR Generator with the total count
+    const qrSent = await generateAndSendTicketQR(
+      mainTicket,
+      tenant,
+      phoneNumber,
+      confirmationMessage,
+      count,
+      config
+    );
+
+    if (qrSent) {
+      console.log(`  ✅ Group QR code sent successfully`);
+    } else {
+      console.warn(`  ⚠️ QR code sending failed`);
+    }
+
+    // 4. Cleanup
+    processingTickets.delete(processingKey);
+    return qrSent;
+
+  } catch (error) {
+    console.error("❌ CRITICAL: Ticket generation failed:", error);
+    const processingKey = `${tenant._id}-${orderId || phoneNumber}`;
+    processingTickets.delete(processingKey);
+    return false;
+  }
+}
+
+module.exports = router;

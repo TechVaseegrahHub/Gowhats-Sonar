@@ -1,0 +1,31 @@
+name = "GoWhats"
+client_id = "4ea977af5a4abc5461e1daef6a268b47"
+application_url = "https://bot.gowhats.in"
+embedded = true
+
+[access_scopes]
+scopes = "read_orders,read_fulfillments,read_products,write_app_proxy"
+
+[auth]
+redirect_urls = [
+  "https://bot.gowhats.in/auth/callback",
+  "https://bot.gowhats.in/auth/shopify/callback",
+  "https://bot.gowhats.in/shopify/auth/callback",
+  "https://bot.gowhats.in/api/shopify/callback",
+]
+
+[webhooks]
+api_version = "2024-07"
+
+[[webhooks.subscriptions]]
+compliance_topics = ["customers/data_request", "customers/redact", "shop/redact"]
+uri = "https://bot.gowhats.in/webhooks"
+
+[app_proxy]
+url = "/app-proxy/restock"
+prefix = "apps"
+subpath = "gowhats-restock"
+
+[build]
+automatically_update_urls_on_dev = false
+

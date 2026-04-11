@@ -1,0 +1,240 @@
+const Settings = require('../models/settings');
+const Order = require('../models/Order');
+const Tenant = require('../models/Tenant');
+const WhatsAppService = require('../services/whatsappServices');
+
+const todayRange = () => {
+  const now = new Date();
+  const istOffset = 5.5 * 60 * 60 * 1000;
+  const istNow = new Date(now.getTime() + istOffset);
+  const start = new Date(Date.UTC(
+    istNow.getUTCFullYear(),
+    istNow.getUTCMonth(),
+    istNow.getUTCDate(),
+    0, 0, 0, 0
+  ) - istOffset);
+  const end = new Date(start.getTime() + 24 * 60 * 60 * 1000 - 1);
+  return { start, end };
+};
+
+const aggregateDailyData = async (tenantId) => {
+  const tenantIdStr = String(tenantId);
+  const { start, end } = todayRange();
+
+  const aggregationResult = await Order.aggregate([
+    {
+      $match: {
+        $expr: {
+          $eq: [{ $toString: '$tenantId' }, tenantIdStr]  // handles ObjectId or String
+        },
+        createdAt: { $gte: start, $lte: end },
+        $or: [
+          { paymentStatus: 'completed' },
+          { 'paymentDetails.status': 'completed' }
+        ]
+      }
+    },
+    {
+      $facet: {
+        totals: [
+          {
+            $group: {
+              _id: null,
+              totalOrdersCount: { $sum: 1 },
+              totalRevenue: { $sum: '$totalAmount' }
+            }
+          }
+        ],
+        productStats: [
+          { $unwind: { path: '$items', preserveNullAndEmptyArrays: true } },
+          {
+            $group: {
+              _id: '$items.name',
+              totalQty: { $sum: { $ifNull: ['$items.quantity', 1] } }
+            }
+          },
+          { $sort: { totalQty: -1 } },
+          { $limit: 1 }
+        ]
+      }
+    }
+  ]);
+
+  const result = aggregationResult[0];
+  const totals = result.totals[0] || { totalOrdersCount: 0, totalRevenue: 0 };
+  const topProduct = result.productStats[0] || { _id: 'N/A', totalQty: 0 };
+
+  const totalOrders = totals.totalOrdersCount;
+  const totalRevenue = totals.totalRevenue;
+  const mostSoldProductName = topProduct._id || 'N/A';
+  const mostSoldProductQty = topProduct.totalQty;
+
+  const Message = require('../models/Message');
+  const totalTemplatesSent = await Message.countDocuments({
+    tenantId: tenantIdStr,
+    timestamp: { $gte: start, $lte: end },
+    $or: [
+      { type: 'template' },
+      { sentFromWABA: true }
+    ]
+  });
+
+  const Contact = require('../models/Contact');
+  const totalNewContacts = await Contact.countDocuments({
+    tenantId: tenantIdStr,
+    createdAt: { $gte: start, $lte: end }
+  });
+
+  return {
+    totalOrders,
+    totalRevenue: totalRevenue.toFixed(2),
+    mostSoldProductName,
+    mostSoldProductQty,
+    totalTemplatesSent,
+    totalNewContacts
+  };
+};
+
+const sendDailySalesReport = async (tenantId) => {
+  const setting = await Settings.findOne({ tenant_id: tenantId });
+  if (!setting || !setting.dailySalesAlert?.enabled) {
+    return { success: false, reason: 'Daily sales alert not enabled for this tenant.' };
+  }
+
+  const tenant = await Tenant.findById(tenantId);
+  if (!tenant || !tenant.whatsappConfig?.accessToken) {
+    return { success: false, reason: 'Tenant WhatsApp not configured.' };
+  }
+
+  const contacts = setting.dailySalesAlert?.contacts || [];
+  if (!contacts.length) {
+    return { success: false, reason: 'No contacts configured.' };
+  }
+
+  const data = await aggregateDailyData(tenantId);
+  const whatsappService = new WhatsAppService(tenant);
+  const axios = require('axios');
+
+  const payloadBase = {
+    messaging_product: 'whatsapp',
+    recipient_type: 'individual',
+    type: 'template',
+    template: {
+      name: 'daily_sales_summary_report',
+      language: { code: 'en' },
+      components: [
+        {
+          type: 'body',
+          parameters: [
+            { type: 'text', text: String(data.totalOrders) },
+            { type: 'text', text: String(data.totalRevenue) },
+            { type: 'text', text: String(data.mostSoldProductName).toLowerCase() },
+            { type: 'text', text: String(data.mostSoldProductQty) },
+            { type: 'text', text: String(data.totalTemplatesSent) },
+            { type: 'text', text: String(data.totalNewContacts) }
+          ]
+        }
+      ]
+    }
+  };
+
+  const results = [];
+  for (const contact of contacts) {
+    if (!contact.phone) continue;
+    try {
+      const formatted = whatsappService.formatPhoneNumber(contact.phone);
+      const url = `${whatsappService.baseUrl}/${whatsappService.phoneNumberId}/messages`;
+
+      await axios.post(url, { ...payloadBase, to: formatted }, {
+        headers: {
+          'Authorization': `Bearer ${whatsappService.accessToken}`,
+          'Content-Type': 'application/json'
+        }
+      });
+
+      results.push({ label: contact.label, phone: contact.phone, sent: true });
+    } catch (err) {
+      console.error(`[DailySalesAlert] Failed to send to ${contact.phone}:`, err.response?.data || err.message);
+      results.push({ label: contact.label, phone: contact.phone, sent: false, error: err.message });
+    }
+  }
+
+  return { success: true, data, results };
+};
+
+exports.getConfig = async (req, res) => {
+  try {
+    const tenantId = req.tenantId || req.user?.tenant_id;
+    console.log("[getConfig] tenantId:", tenantId);
+    const setting = await Settings.findOne({ tenant_id: tenantId }).lean();
+    const config = setting?.dailySalesAlert || null;
+
+    res.json({
+      success: true,
+      config: {
+        enabled: config?.enabled === true,
+        sendTime: config?.sendTime || '20:00',
+        contacts: Array.isArray(config?.contacts) ? config.contacts : []
+      }
+    });
+  } catch (err) {
+    console.error('[DailySalesAlert] getConfig error:', err.message);
+    res.status(500).json({ success: false, error: 'Failed to fetch config.' });
+  }
+};
+
+exports.saveConfig = async (req, res) => {
+  try {
+    const tenantId = req.tenantId || req.user?.tenant_id;
+    console.log("[saveConfig] tenantId:", tenantId);
+    const { enabled, sendTime, contacts } = req.body;
+
+    const sanitizedContacts = Array.isArray(contacts)
+      ? contacts.map(c => ({ label: String(c.label || 'Admin'), phone: String(c.phone || '') }))
+      : [];
+
+    await Settings.findOneAndUpdate(
+      { tenant_id: tenantId },
+      {
+        $set: {
+          'dailySalesAlert.enabled': enabled === true,
+          'dailySalesAlert.sendTime': sendTime || '20:00',
+          'dailySalesAlert.contacts': sanitizedContacts,
+          'dailySalesAlert.lastSentDate': ''
+        }
+      },
+      { upsert: true }
+    );
+
+    const updated = await Settings.findOne({ tenant_id: tenantId }).lean();
+    const savedConfig = updated?.dailySalesAlert;
+
+    res.json({
+      success: true,
+      config: {
+        enabled: savedConfig?.enabled === true,
+        sendTime: savedConfig?.sendTime || '20:00',
+        contacts: Array.isArray(savedConfig?.contacts) ? savedConfig.contacts : []
+      }
+    });
+  } catch (err) {
+    console.error('[DailySalesAlert] saveConfig error:', err.message);
+    res.status(500).json({ success: false, error: 'Failed to save config.' });
+  }
+};
+
+exports.triggerNow = async (req, res) => {
+  try {
+    const tenantId = req.tenantId || req.user?.tenant_id;
+    console.log("[triggerNow] tenantId:", tenantId);
+    const result = await sendDailySalesReport(tenantId);
+    if (!result.success) return res.status(400).json(result);
+    res.json({ success: true, message: 'Daily sales report sent!', ...result });
+  } catch (err) {
+    console.error('[DailySalesAlert] triggerNow error:', err.message);
+    res.status(500).json({ success: false, error: 'Failed to send report.' });
+  }
+};
+
+
+module.exports.sendDailySalesReport = sendDailySalesReport;
