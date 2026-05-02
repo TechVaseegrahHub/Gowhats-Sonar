@@ -69,6 +69,8 @@ const wooCommerceRestockRoutes = require('./routes/woocommerceRestock');
 const dailySalesAlertRoutes = require('./routes/dailySalesAlert');
 const callingRoutes = require('./routes/calling');
 const devicesRoutes = require('./routes/devices');
+const pushRoutes = require('./routes/push');
+const billingV1 = require('./routes/v1/billing');
 
 // Start schedulers
 startAbandonedCartScheduler();
@@ -191,6 +193,7 @@ app.use('/api/contacts', [auth, checkTenant], contactsRoutes);
 app.use('/api/templates', [auth, checkTenant], templatesRoutes);
 app.use('/api/calling', callingRoutes);
 app.use('/api/devices', devicesRoutes);
+app.use('/api/v1/billing', billingV1);
 
 app.get('/api/inventory/proxy-image', async (req, res) => {
   const imageUrl = req.query.url;
@@ -274,6 +277,7 @@ app.use('/api/packing', [auth, checkTenant], packingRoutes);
 app.use('/api/printing', [auth, checkTenant], printingRoutes);
 app.use('/api/order-status', [auth, checkTenant], orderStatusRoutes);
 app.use('/api/tickets', [auth, checkTenant], ticketRoutes);
+app.use('/api/push', [auth, checkTenant], pushRoutes);
 app.use('/api/catalog-settings', [auth, checkTenant], catalogSettingsRoutes);
 app.use('/api/registration-config', [auth, checkTenant], registrationConfigRoutes);
 app.use('/', publicRoutes);

@@ -3,12 +3,15 @@ const express = require('express');
 const axios = require('axios');
 const crypto = require('crypto');
 const Stripe = require('stripe');
+const jwt = require('jsonwebtoken');
 const router = express.Router();
 const TenantConfig = require('../models/TenantConfig');
 const Tenant = require('../models/Tenant');
 const User = require('../models/User');
 const Message = require('../models/Message');
 const ReferralClient = require('../models/ReferralClient');
+const Integration = require('../models/Integration');
+const ShopifyApiService = require('../services/shopifyApiService');
 const authenticateToken = require('../middleware/auth');
 const {
   buildSubscriptionState,
@@ -105,6 +108,147 @@ const resolveTenantId = (req) =>
   req.query?.tenantId ||
   req.body?.tenantId;
 
+const isShopifyBillingRequest = (req) =>
+  req.user?.auth_source === 'shopify_embedded_session' || Boolean(req.user?.shopify_shop);
+
+const getShopifyBillingPlan = () => ({
+  name: process.env.SHOPIFY_BILLING_PLAN_NAME || 'GoWhats Pro',
+  amount: Number(process.env.SHOPIFY_BILLING_PRICE || process.env.SHOPIFY_BILLING_PRICE_USD || 10),
+  currencyCode: String(process.env.SHOPIFY_BILLING_CURRENCY || 'USD').toUpperCase(),
+  interval: process.env.SHOPIFY_BILLING_INTERVAL || 'EVERY_30_DAYS',
+  test: String(process.env.SHOPIFY_BILLING_TEST || '').toLowerCase() === 'true',
+  trialDays: Number(process.env.SHOPIFY_BILLING_TRIAL_DAYS || 0)
+});
+
+const getPublicBaseUrl = (req) => {
+  const configured =
+    process.env.PUBLIC_API_URL ||
+    process.env.API_PUBLIC_URL ||
+    process.env.SERVER_URL ||
+    `${req.protocol}://${req.get('host')}`;
+
+  return String(configured || '').replace(/\/$/, '');
+};
+
+const getFrontendBaseUrl = (req) => (
+  process.env.CLIENT_URL ||
+  process.env.FRONTEND_URL ||
+  req.headers.origin ||
+  'http://localhost:5173'
+).replace(/\/$/, '');
+
+const signShopifyBillingReturnToken = ({ tenantId, shop }) => {
+  if (!process.env.JWT_SECRET) {
+    throw new Error('JWT_SECRET is missing on the server');
+  }
+
+  return jwt.sign(
+    { tenantId: String(tenantId), shop: String(shop), purpose: 'shopify_billing_return' },
+    process.env.JWT_SECRET,
+    { expiresIn: '2h' }
+  );
+};
+
+const verifyShopifyBillingReturnToken = (token) => {
+  const decoded = jwt.verify(token, process.env.JWT_SECRET);
+  if (decoded?.purpose !== 'shopify_billing_return' || !decoded?.tenantId || !decoded?.shop) {
+    throw new Error('Invalid Shopify billing return token');
+  }
+  return decoded;
+};
+
+const findShopifyBillingIntegration = async (tenantId, shop = '') => {
+  const normalizedShop = ShopifyApiService.normalizeShopDomain(shop || '');
+  const query = {
+    tenantId: String(tenantId),
+    storeType: 'shopify',
+    connectedVia: 'oauth',
+    isActive: { $ne: false },
+    adminAccessToken: { $ne: null }
+  };
+
+  if (normalizedShop) {
+    query.storeUrl = normalizedShop;
+  }
+
+  return Integration.findOne(query).sort({ updatedAt: -1 });
+};
+
+const getSubscriptionPriceFromShopify = (subscription = {}) => {
+  const pricingDetails = subscription?.lineItems?.[0]?.plan?.pricingDetails || {};
+  return {
+    amount: Number(pricingDetails?.price?.amount || getShopifyBillingPlan().amount),
+    currency: String(pricingDetails?.price?.currencyCode || getShopifyBillingPlan().currencyCode).toUpperCase()
+  };
+};
+
+const syncShopifyBillingSubscription = async ({ tenantId, shop = '' }) => {
+  const integration = await findShopifyBillingIntegration(tenantId, shop);
+  if (!integration?.adminAccessToken) {
+    return { integration: null, tenant: await Tenant.findById(tenantId), activeSubscription: null };
+  }
+
+  const shopifyApi = new ShopifyApiService(
+    integration.storeUrl,
+    integration.adminAccessToken,
+    integration.apiConfig?.version || process.env.SHOPIFY_API_VERSION || '2024-10'
+  );
+  const activeSubscriptions = await shopifyApi.getActiveAppSubscriptions();
+  const activeSubscription = activeSubscriptions.find((subscription) => subscription?.status === 'ACTIVE') || null;
+
+  if (!activeSubscription) {
+    return { integration, tenant: await Tenant.findById(tenantId), activeSubscription: null };
+  }
+
+  const now = new Date();
+  const price = getSubscriptionPriceFromShopify(activeSubscription);
+  const currentPeriodEnd = activeSubscription.currentPeriodEnd
+    ? new Date(activeSubscription.currentPeriodEnd)
+    : null;
+
+  const updatedTenant = await Tenant.findByIdAndUpdate(
+    tenantId,
+    {
+      $set: {
+        'subscription.plan': 'pro',
+        'subscription.proActivatedAt': now,
+        'subscription.proExpiresAt': currentPeriodEnd,
+        'subscription.paymentStatus': 'paid',
+        'subscription.updatedAt': now,
+        'subscription.shopify.subscriptionId': activeSubscription.id,
+        'subscription.shopify.name': activeSubscription.name || getShopifyBillingPlan().name,
+        'subscription.shopify.amount': price.amount,
+        'subscription.shopify.currency': price.currency,
+        'subscription.shopify.status': activeSubscription.status,
+        'subscription.shopify.test': Boolean(activeSubscription.test),
+        'subscription.shopify.currentPeriodEnd': currentPeriodEnd,
+        'subscription.shopify.createdAt': activeSubscription.createdAt ? new Date(activeSubscription.createdAt) : now,
+        'subscription.shopify.activatedAt': now
+      },
+      $push: {
+        'subscription.history': {
+          $each: [createSubscriptionHistoryEntry({
+            provider: 'shopify',
+            event: 'payment_paid',
+            plan: 'pro',
+            paymentStatus: 'paid',
+            amount: price.amount,
+            currency: price.currency,
+            referenceId: activeSubscription.id,
+            createdAt: activeSubscription.createdAt || now,
+            paidAt: now,
+            notes: 'Shopify Billing API subscription active'
+          })],
+          $slice: -100
+        }
+      }
+    },
+    { new: true, upsert: true, setDefaultsOnInsert: true }
+  );
+
+  return { integration, tenant: updatedTenant, activeSubscription };
+};
+
 const buildSubscriptionPayload = (subscription) => ({
   plan: subscription.plan,
   isPro: subscription.isPro,
@@ -112,6 +256,7 @@ const buildSubscriptionPayload = (subscription) => ({
   trial: subscription.trial,
   pro: subscription.pro,
   pricing: subscription.pricing,
+  billing: subscription.billing || { provider: 'internal' },
   referral: subscription.referral || { hasReferral: false },
   proOnlyModules: subscription.proOnlyModules,
   websiteIntegration: {
@@ -334,7 +479,50 @@ router.get('/subscription', authenticateToken, async (req, res) => {
       });
     }
 
+   let activeShopifySubscription = null;
+    const shouldUseShopifyBilling = isShopifyBillingRequest(req);
+    if (shouldUseShopifyBilling) {
+      try {
+        const syncResult = await syncShopifyBillingSubscription({
+          tenantId,
+          shop: req.user?.shopify_shop || req.query?.shop || ''
+        });
+        if (syncResult.tenant) {
+          tenant = syncResult.tenant;
+        }
+        activeShopifySubscription = syncResult.activeSubscription;
+      } catch (billingError) {
+        console.error('Error syncing Shopify billing subscription:', billingError.message || billingError);
+      }
+    }
+
     let subscription = buildSubscriptionState(tenant);
+
+   if (shouldUseShopifyBilling && !activeShopifySubscription) {
+      const tenantObject = typeof tenant.toObject === 'function' ? tenant.toObject() : tenant;
+      subscription = buildSubscriptionState({
+        ...tenantObject,
+        subscription: {
+          ...(tenantObject?.subscription || {}),
+          plan: 'free_trial',
+          paymentStatus: null,
+          proActivatedAt: null,
+          proExpiresAt: null
+        }
+      });
+      subscription.billing = {
+        provider: 'shopify',
+        requiresShopifyBilling: true,
+        hasActiveShopifySubscription: false
+      };
+    } else if (shouldUseShopifyBilling) {
+      subscription.billing = {
+        provider: 'shopify',
+        requiresShopifyBilling: true,
+        hasActiveShopifySubscription: true,
+        subscriptionId: activeShopifySubscription?.id || ''
+      };
+    }
 
     const websiteOrderConfirmationSentActual = await Message.countDocuments({
       tenantId: tenantId,
@@ -358,10 +546,36 @@ router.get('/subscription', authenticateToken, async (req, res) => {
         { new: true }
       );
       subscription = buildSubscriptionState(tenant);
+      if (shouldUseShopifyBilling && !activeShopifySubscription) {
+        const tenantObject = typeof tenant.toObject === 'function' ? tenant.toObject() : tenant;
+        subscription = buildSubscriptionState({
+          ...tenantObject,
+          subscription: {
+            ...(tenantObject?.subscription || {}),
+            plan: 'free_trial',
+            paymentStatus: null,
+            proActivatedAt: null,
+            proExpiresAt: null
+          }
+        });
+      }
     }
 
     subscription = await applyDynamicPricing(req, subscription, tenantId);
-
+    if (shouldUseShopifyBilling) {
+      const plan = getShopifyBillingPlan();
+      subscription.pricing = {
+        ...subscription.pricing,
+        proPrice: plan.amount,
+        currency: plan.currencyCode
+      };
+      subscription.billing = subscription.billing || {
+        provider: 'shopify',
+        requiresShopifyBilling: true,
+        hasActiveShopifySubscription: Boolean(activeShopifySubscription)
+      };
+    }
+    
     return res.json({
       success: true,
       subscription: buildSubscriptionPayload(subscription)
@@ -455,6 +669,155 @@ const updatedTenant = await Tenant.findByIdAndUpdate(
       success: false,
       message: 'Internal server error'
     });
+  }
+});
+
+router.post('/subscription/shopify/create', authenticateToken, async (req, res) => {
+  try {
+    const tenantId = resolveTenantId(req);
+    if (!tenantId) {
+      return res.status(400).json({ success: false, message: 'Tenant ID is required' });
+    }
+
+    const integration = await findShopifyBillingIntegration(tenantId, req.user?.shopify_shop || req.body?.shop || '');
+    if (!integration?.adminAccessToken) {
+      return res.status(400).json({
+        success: false,
+        message: 'Install the Shopify app through OAuth before starting Shopify billing'
+      });
+    }
+
+    const shopifyApi = new ShopifyApiService(
+      integration.storeUrl,
+      integration.adminAccessToken,
+      integration.apiConfig?.version || process.env.SHOPIFY_API_VERSION || '2024-10'
+    );
+    const activeSubscriptions = await shopifyApi.getActiveAppSubscriptions();
+    const activeSubscription = activeSubscriptions.find((subscription) => subscription?.status === 'ACTIVE');
+
+    if (activeSubscription) {
+      const syncResult = await syncShopifyBillingSubscription({ tenantId, shop: integration.storeUrl });
+      const subscription = buildSubscriptionState(syncResult.tenant);
+      subscription.billing = {
+        provider: 'shopify',
+        requiresShopifyBilling: true,
+        hasActiveShopifySubscription: true,
+        subscriptionId: activeSubscription.id
+      };
+
+      return res.json({
+        success: true,
+        alreadyActive: true,
+        subscription: buildSubscriptionPayload(subscription)
+      });
+    }
+
+    const plan = getShopifyBillingPlan();
+    if (!Number.isFinite(plan.amount) || plan.amount <= 0) {
+      return res.status(500).json({
+        success: false,
+        message: 'Shopify billing price is not configured'
+      });
+    }
+
+    const returnToken = signShopifyBillingReturnToken({ tenantId, shop: integration.storeUrl });
+    const returnUrl = new URL(`${getPublicBaseUrl(req)}/api/tenant/subscription/shopify/confirm`);
+    returnUrl.searchParams.set('token', returnToken);
+
+    const created = await shopifyApi.createRecurringAppSubscription({
+      name: plan.name,
+      amount: plan.amount,
+      currencyCode: plan.currencyCode,
+      returnUrl: returnUrl.toString(),
+      interval: plan.interval,
+      test: plan.test,
+      trialDays: plan.trialDays
+    });
+
+    const pendingSubscription = created.appSubscription || {};
+    await Tenant.findByIdAndUpdate(
+      tenantId,
+      {
+        $set: {
+          'subscription.paymentStatus': 'pending',
+          'subscription.updatedAt': new Date(),
+          'subscription.shopify.subscriptionId': pendingSubscription.id || '',
+          'subscription.shopify.name': plan.name,
+          'subscription.shopify.amount': plan.amount,
+          'subscription.shopify.currency': plan.currencyCode,
+          'subscription.shopify.status': pendingSubscription.status || 'PENDING',
+          'subscription.shopify.test': plan.test,
+          'subscription.shopify.createdAt': new Date()
+        },
+        $push: {
+          'subscription.history': {
+            $each: [createSubscriptionHistoryEntry({
+              provider: 'shopify',
+              event: 'payment_pending',
+              plan: 'pro',
+              paymentStatus: 'pending',
+              amount: plan.amount,
+              currency: plan.currencyCode,
+              referenceId: pendingSubscription.id || '',
+              createdAt: new Date(),
+              notes: 'Shopify Billing API approval URL created'
+            })],
+            $slice: -100
+          }
+        }
+      },
+      { new: true, upsert: true, setDefaultsOnInsert: true }
+    );
+
+    return res.json({
+      success: true,
+      provider: 'shopify',
+      confirmationUrl: created.confirmationUrl,
+      subscriptionId: pendingSubscription.id || ''
+    });
+  } catch (error) {
+    console.error('Error creating Shopify subscription:', error.response?.data || error.message || error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to start Shopify billing'
+    });
+  }
+});
+
+router.get('/subscription/shopify/confirm', async (req, res) => {
+  const frontendBaseUrl = getFrontendBaseUrl(req);
+
+  try {
+    const decoded = verifyShopifyBillingReturnToken(req.query?.token || '');
+    const syncResult = await syncShopifyBillingSubscription({
+      tenantId: decoded.tenantId,
+      shop: decoded.shop
+    });
+
+    const redirectUrl = new URL('/admin', frontendBaseUrl);
+    redirectUrl.searchParams.set('shopify_billing', syncResult.activeSubscription ? 'active' : 'pending');
+    redirectUrl.searchParams.set('shop', decoded.shop);
+
+    if (global.io && syncResult.tenant) {
+      const subscription = buildSubscriptionState(syncResult.tenant);
+      subscription.billing = {
+        provider: 'shopify',
+        requiresShopifyBilling: true,
+        hasActiveShopifySubscription: Boolean(syncResult.activeSubscription),
+        subscriptionId: syncResult.activeSubscription?.id || ''
+      };
+      global.io.to(String(decoded.tenantId)).emit('subscription_plan_updated', {
+        source: 'shopify',
+        subscription: buildSubscriptionPayload(subscription)
+      });
+    }
+
+    return res.redirect(redirectUrl.toString());
+  } catch (error) {
+    console.error('Shopify billing confirmation failed:', error.message || error);
+    const redirectUrl = new URL('/admin', frontendBaseUrl);
+    redirectUrl.searchParams.set('shopify_billing', 'error');
+    return res.redirect(redirectUrl.toString());
   }
 });
 

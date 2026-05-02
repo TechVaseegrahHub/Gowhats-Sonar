@@ -1,35 +1,40 @@
 // middleware/auth.js
 const jwt = require('jsonwebtoken');
 
+const isDev = process.env.NODE_ENV !== 'production';
+const log = (...args) => { if (isDev) console.log(...args); };
+const logError = (...args) => { if (isDev) console.error(...args); };
+
 const authMiddleware = (req, res, next) => {
-  console.log("🔐 AUTH MIDDLEWARE");
-  console.log("🔐 URL:", req.url);
+  log('🔐 AUTH MIDDLEWARE');
+  log('🔐 URL:', req.url);
+
   try {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) {
-      console.log("❌ No token provided");
+      log('❌ No token provided');
       return res.status(401).json({
         success: false,
         message: 'Authentication required'
       });
     }
+
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    console.log("✅ Token decoded:", {
+    log('✅ Token decoded:', {
       id: decoded.id,
       tenant_id: decoded.tenant_id,
-      tenantId: decoded.tenantId,
       email: decoded.email
     });
-    // Get tenant_id from either field name
+
     const tenantId = decoded.tenant_id || decoded.tenantId;
     if (!tenantId) {
-      console.error('❌ Token missing tenant_id');
+      logError('❌ Token missing tenant_id');
       return res.status(401).json({
         success: false,
         message: 'Invalid token - missing tenant information'
       });
     }
-    // Set user with BOTH field names for compatibility
+
     req.user = {
       id: decoded.id || decoded._id,
       _id: decoded.id || decoded._id,
@@ -39,37 +44,51 @@ const authMiddleware = (req, res, next) => {
       name: decoded.name,
       role: decoded.role,
       phone_number: decoded.phone_number,
-      company_name: decoded.company_name
+      company_name: decoded.company_name,
+      shopify_shop: decoded.shopify_shop,
+      auth_source: decoded.auth_source
     };
-    console.log("✅ Auth successful:", {
-      userId: req.user.id,
-      tenant_id: req.user.tenant_id
-    });
+
+    log('✅ Auth successful:', { userId: req.user.id, tenant_id: req.user.tenant_id });
     next();
+
   } catch (error) {
-    console.error('❌ Auth error:', error.name, error.message);
+    logError('❌ Auth error:', error.name, error.message);
+
     if (error.name === 'TokenExpiredError') {
       return res.status(401).json({
         success: false,
         message: 'Session expired. Please login again.',
         expired: true
       });
-    } else if (error.name === 'JsonWebTokenError') {
+    }
+    if (error.name === 'JsonWebTokenError') {
       return res.status(401).json({
         success: false,
         message: 'Invalid token. Please login again.',
         invalid: true
       });
-    } else {
-      return res.status(401).json({
-        success: false,
-        message: 'Authentication failed'
-      });
     }
+    return res.status(401).json({
+      success: false,
+      message: 'Authentication failed'
+    });
   }
 };
 
-// Export as both default and named exports
+
+const requireAdmin = (req, res, next) => {
+  if (!req.user || req.user.role !== 'admin') {
+    return res.status(403).json({
+      success: false,
+      message: 'Admin role required'
+    });
+  }
+  next();
+};
+
 module.exports = authMiddleware;
 module.exports.authenticateToken = authMiddleware;
 module.exports.auth = authMiddleware;
+module.exports.authenticate = authMiddleware;  
+module.exports.requireAdmin = requireAdmin;

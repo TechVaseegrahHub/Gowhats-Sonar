@@ -68,3 +68,80 @@ registerRoute(
   'POST',
 );
 
+const DEFAULT_NOTIFICATION_ICON = '/icons/icon-192.png';
+const DEFAULT_NOTIFICATION_BADGE = '/icons/icon-192.png';
+
+const parsePushPayload = (event) => {
+  if (!event.data) {
+    return {};
+  }
+
+  try {
+    return event.data.json();
+  } catch (_error) {
+    return { body: event.data.text() };
+  }
+};
+
+const buildNotificationOptions = (payload = {}) => ({
+  body: payload.body || 'You have a new update in GoWhats.',
+  icon: payload.icon || DEFAULT_NOTIFICATION_ICON,
+  badge: payload.badge || DEFAULT_NOTIFICATION_BADGE,
+  tag: payload.tag || 'gowhats-notification',
+  renotify: Boolean(payload.renotify),
+  requireInteraction: Boolean(payload.requireInteraction),
+  actions: Array.isArray(payload.actions) ? payload.actions : [{ action: 'open', title: 'Open GoWhats' }],
+  data: {
+    url: payload.url || '/admin',
+    phoneNumber: payload.phoneNumber || null,
+    messageId: payload.messageId || null,
+    tenantId: payload.tenantId || null,
+    kind: payload.data?.kind || null,
+    ...payload.data
+  }
+});
+
+self.addEventListener('push', (event) => {
+  const payload = parsePushPayload(event);
+  const title = payload.title || 'GoWhats';
+  const options = buildNotificationOptions(payload);
+
+  event.waitUntil(self.registration.showNotification(title, options));
+});
+
+async function focusOrOpenWindow(url) {
+  const clientList = await self.clients.matchAll({
+    type: 'window',
+    includeUncontrolled: true
+  });
+
+  for (const client of clientList) {
+    if (!('focus' in client)) {
+      continue;
+    }
+
+    if ('navigate' in client) {
+      await client.navigate(url);
+    }
+
+    return client.focus();
+  }
+
+  if (self.clients.openWindow) {
+    return self.clients.openWindow(url);
+  }
+
+  return null;
+}
+
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+
+  const targetUrl = new URL(
+    event.notification?.data?.url || '/admin',
+    self.location.origin
+  ).href;
+
+  event.waitUntil(focusOrOpenWindow(targetUrl));
+});
+

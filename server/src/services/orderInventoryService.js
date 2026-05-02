@@ -312,7 +312,8 @@ async function applyInventoryDeductionForOrder(order) {
       ) {
         const retailerId = asString(latestItem.retailer_id || item.retailerId || item.retailer_id || '-');
         const variables = {
-          productName: asString(latestItem.name || item.name || 'Unnamed Product'),
+        // productName: asString(latestItem.name || item.name || 'Unnamed Product'),
+ 	  productName: asString(buildCatalogProductName(latestItem) || item.name || 'Unnamed Product'),
           retailerId,
           currentStock: updatedStock,
           threshold: alertConfig.threshold

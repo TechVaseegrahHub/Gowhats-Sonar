@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import toast from 'react-hot-toast';
 import api from '../utils/axios';
 import { useAuth } from '../context/AuthContext';
+import { isShopifyEmbeddedApp } from '../utils/shopifyEmbedded';
 
 const loadRazorpayScript = () => new Promise((resolve) => {
   if (typeof window === 'undefined') {
@@ -78,11 +79,50 @@ const UpgradeToProButton = ({
     }
   };
 
+ const startShopifyUpgrade = async () => {
+    try {
+      const response = await api.post('/api/tenant/subscription/shopify/create');
+      if (!response?.data?.success) {
+        toast.error(response?.data?.message || 'Failed to start Shopify billing');
+        setLoading(false);
+        return;
+      }
+
+      if (response.data.alreadyActive) {
+        toast.success('Shopify subscription is active. Pro plan enabled.');
+        if (onSuccess) {
+          onSuccess(response.data);
+        } else {
+          navigate('/admin');
+        }
+        setLoading(false);
+        return;
+      }
+
+      if (!response.data.confirmationUrl) {
+        toast.error('Shopify did not return a billing approval URL.');
+        setLoading(false);
+        return;
+      }
+
+      const targetWindow = window.top || window;
+      targetWindow.location.href = response.data.confirmationUrl;
+    } catch (err) {
+      toast.error(err.response?.data?.message || 'Failed to start Shopify billing');
+      setLoading(false);
+    }
+  };
+
   const startUpgrade = async () => {
     if (loading) return;
     setLoading(true);
 
     try {
+      if (isShopifyEmbeddedApp()) {
+        await startShopifyUpgrade();
+        return;
+      }
+
       const phoneNumber = await resolvePhoneNumber();
       if (!isIndiaPhone(phoneNumber)) {
         await startStripeUpgrade();

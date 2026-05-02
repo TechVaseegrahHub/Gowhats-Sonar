@@ -129,6 +129,9 @@ router.get('/all-tenants', adminAuth, async (req, res) => {
     const tenantsWithDetails = await Promise.all(tenants.map(async (tenant) => {
       // Fetch business name from TenantConfig
       const config = await TenantConfig.findOne({ tenantId: tenant._id }).lean();
+      const settings = await Settings.findOne({ tenant_id: tenant._id })
+        .select('aiConfig')
+        .lean();
       const referralClientDoc = await ReferralClient.findOne({ tenantId: String(tenant._id) }).lean();
       const referralClient = referralClientDoc
         ? await syncReferralClientPricing(referralClientDoc, { persist: true })
@@ -199,6 +202,10 @@ router.get('/all-tenants', adminAuth, async (req, res) => {
         name: config?.businessName || adminUser?.company_name || tenant.name || `Tenant ${tenant._id.substring(0, 8)}`,
         users,
         config: config || null,
+        featureModules: {
+          productImageFetchEnabled: Boolean(settings?.aiConfig?.productImageFetchEnabled),
+          cloudinaryImageUploadEnabled: settings?.aiConfig?.cloudinaryImageUploadEnabled !== false
+        },
         subscription: toAdminSubscriptionPayload(tenant, { referralClient }),
         analytics: {
           broadcasts: broadcastCount,
@@ -573,6 +580,103 @@ router.patch('/tenant/:tenantId/product-image-module', adminAuth, async (req, re
   }
 });
 
+router.get('/tenant/:tenantId/cloudinary-image-upload-module', adminAuth, async (req, res) => {
+  try {
+    const { tenantId } = req.params;
+
+    if (!tenantId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Tenant ID is required'
+      });
+    }
+
+    const tenantExists = await Tenant.exists({ _id: tenantId });
+    if (!tenantExists) {
+      return res.status(404).json({
+        success: false,
+        message: 'Tenant not found'
+      });
+    }
+
+    let settings = await Settings.findOne({ tenant_id: tenantId });
+    if (!settings) {
+      settings = await Settings.create({ tenant_id: tenantId });
+    }
+
+    const enabled = settings?.aiConfig?.cloudinaryImageUploadEnabled !== false;
+
+    return res.json({
+      success: true,
+      tenantId,
+      enabled,
+      module: 'cloudinary_image_upload'
+    });
+  } catch (error) {
+    console.error('Error fetching tenant Cloudinary image upload module status:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to fetch Cloudinary image upload module status'
+    });
+  }
+});
+
+router.patch('/tenant/:tenantId/cloudinary-image-upload-module', adminAuth, async (req, res) => {
+  try {
+    const { tenantId } = req.params;
+    const { enabled } = req.body || {};
+
+    if (!tenantId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Tenant ID is required'
+      });
+    }
+
+    if (typeof enabled !== 'boolean') {
+      return res.status(400).json({
+        success: false,
+        message: 'enabled must be a boolean value'
+      });
+    }
+
+    const tenantExists = await Tenant.exists({ _id: tenantId });
+    if (!tenantExists) {
+      return res.status(404).json({
+        success: false,
+        message: 'Tenant not found'
+      });
+    }
+
+    let settings = await Settings.findOne({ tenant_id: tenantId });
+    if (!settings) {
+      settings = new Settings({ tenant_id: tenantId });
+    }
+
+    if (!settings.aiConfig) {
+      settings.aiConfig = {};
+    }
+
+    settings.aiConfig.cloudinaryImageUploadEnabled = enabled;
+    settings.markModified('aiConfig');
+    await settings.save();
+
+    return res.json({
+      success: true,
+      tenantId,
+      enabled: settings.aiConfig.cloudinaryImageUploadEnabled,
+      module: 'cloudinary_image_upload',
+      message: `Cloudinary image upload ${enabled ? 'enabled' : 'disabled'} successfully`
+    });
+  } catch (error) {
+    console.error('Error updating tenant Cloudinary image upload module status:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to update Cloudinary image upload module status'
+    });
+  }
+});
+
 router.get('/referrals/overview', adminAuth, async (req, res) => {
   try {
     const month = String(req.query.month || formatMonthKey()).trim();
@@ -770,4 +874,3 @@ router.post('/referrals/partner/:partnerId/mark-paid', adminAuth, async (req, re
 });
 
 module.exports = router;
-

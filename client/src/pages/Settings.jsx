@@ -5,6 +5,7 @@ import QuickResponse from "../components/QuickResponse.jsx";
 import WelcomeTemplates from "../components/WelcomeTemplates.jsx";
 import ShippingSettings from "../components/ShippingManager.jsx";
 import WhatsAppConnectPage from "../pages/WhatsAppConnect";
+import BotToggle from "../components/BotToggle.jsx";
 import StoreIntegration from "../pages/StoreIntegration.jsx";
 import InventoryPage from "../pages/Inventory.jsx";
 import RegistrationFormConfig from "../components/RegistrationFormConfig.jsx";
@@ -12,6 +13,7 @@ import Razorpay from "../pages/RazorpayIntegration.jsx";
 import OrderAutomationConfig from "../components/OrderAutomationConfig.jsx";
 import FlowStudio from "../components/FlowStudio.jsx";
 import ApiKeys from '../components/Settings/ApiKeys';
+import PushNotificationsSettings from '../components/Settings/PushNotifications.jsx';
 import FileUpload from "./FileUpload.jsx";
 import GoogleSheetsTracking from "./GoogleSheetsTracking.jsx";
 import GoogleCalendar from "./GoogleCalendar.jsx";
@@ -60,6 +62,13 @@ const MOBILE_SETTINGS_MENU_ITEMS = [
   { id: "device-security", section: "admin-tools", label: "Device Auth", image: ApiKeysMenuIconImage, description: "Session Security" }, // ADDED HERE
   { id: "welcome", section: "admin-tools", label: "Welcome", image: WelcomeMenuIconImage, description: "Messages" },
   { id: "inventory", section: "admin-tools", label: "Inventory", image: InventoryMenuIconImage, description: "Catalog" },
+  {
+    id: "push-notifications",
+    section: "admin-tools",
+    label: "Push Alerts",
+    image: WelcomeMenuIconImage,
+    description: "PWA Push",
+  },
   { id: "daily-sales-alert", section: "admin-tools", label: "Sales Alert", image: BotMenuIconImage, description: "Daily Report" },
 ];
 
@@ -88,6 +97,12 @@ const DESKTOP_SETTINGS_MENU_ITEMS = [
   { id: "api-keys", label: "API Keys", image: ApiKeysMenuIconImage, description: "API Integration & Keys" },
   { id: "device-security", label: "Device Security", image: ApiKeysMenuIconImage, description: "Manage team device sessions & access codes" }, // ADDED HERE
   { id: "welcome", label: "Welcome Messages", image: WelcomeMenuIconImage, description: "Custom greeting templates" },
+  {
+    id: "push-notifications",
+    label: "Push Notifications",
+    image: WelcomeMenuIconImage,
+    description: "PWA alerts & test"
+  },
   { id: "daily-sales-alert", label: "Daily Sales Alert", image: BotMenuIconImage, description: "Automated daily report" },
 ];
 
@@ -235,13 +250,27 @@ const ApiKeysWrapper = () => (
   <div className="p-4 lg:p-10"><div className="max-w-7xl mx-auto"><ApiKeys /></div></div>
 );
 
+const PushNotificationsWrapper = () => (
+  <div className="p-4 lg:p-10">
+    <div className="max-w-7xl mx-auto">
+      <PushNotificationsSettings />
+    </div>
+  </div>
+);
+
 const BotSettingsComponent = ({ embedded = false }) => {
   return (
     <div className="p-4 lg:p-10">
-      <div className="max-w-7xl mx-auto">
+      <div className="max-w-7xl mx-auto space-y-6">
+
+        {/* Bot ON/OFF Toggle */}
+        <BotToggle />
+
+        {/* Knowledge Base Upload */}
         <div className="bg-white border border-gray-200 rounded-2xl shadow-sm p-4 lg:p-8">
           <FileUpload embedded={embedded} />
         </div>
+
       </div>
     </div>
   );
@@ -446,6 +475,8 @@ const SettingsPage = () => {
       case "razorpay": return <RazorpayComponent />;
       case "quick": return <QuickResponseComponent />;
       case "welcome": return <WelcomeComponent />;
+      case "push-notifications":
+        return <PushNotificationsWrapper />;
       case "inventory": return <InventoryComponent />;
 
       default:

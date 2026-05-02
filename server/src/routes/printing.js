@@ -2,6 +2,123 @@ const express = require('express');
 const router = express.Router();
 const Order = require('../models/Order');
 const auth = require('../middleware/auth');
+const net = require('net');
+const Settings = require('../models/settings');
+
+const DEFAULT_PRINTER_CONNECTION = {
+  type: 'browser',
+  network: { host: '', port: 9100 },
+  paperWidth: '4x4',
+  autoPrintOnSale: false,
+  printMode: 'pdf',
+  lastSelectedAt: null,
+  status: 'Not configured',
+  deviceLabel: '',
+  lastTestedAt: null
+};
+
+function normalizeLabelFormat(labelFormat) {
+  return ['thermal', 'thermal6', 'a4'].includes(labelFormat) ? labelFormat : 'thermal';
+}
+
+function normalizePrinterConnection(connection = {}) {
+  return {
+    ...DEFAULT_PRINTER_CONNECTION,
+    ...connection,
+    network: {
+      ...DEFAULT_PRINTER_CONNECTION.network,
+      ...(connection.network || {})
+    }
+  };
+}
+
+function normalizeFromAddress(fromAddress = {}) {
+  const source = fromAddress?.toObject?.() || fromAddress || {};
+  return {
+    name: source.name || '',
+    address1: source.address1 || '',
+    address2: source.address2 || '',
+    city: source.city || '',
+    state: source.state || '',
+    zipCode: source.zipCode || '',
+    phone: source.phone || ''
+  };
+}
+
+function normalizePrintingConfig(printingConfig = {}) {
+  const source = printingConfig?.toObject?.() || printingConfig || {};
+  return {
+    fromAddress: normalizeFromAddress(source.fromAddress),
+    labelFormat: normalizeLabelFormat(source.labelFormat),
+    printerConnection: normalizePrinterConnection(source.printerConnection)
+  };
+}
+
+function normalizePrinterPayload(body = {}) {
+  const allowedTypes = new Set(['browser', 'network', 'bluetooth', 'usb']);
+  const allowedPaperWidths = new Set(['58mm', '80mm', '4x4', 'a4']);
+  const allowedPrintModes = new Set(['pdf', 'graphical', 'text']);
+  const type = allowedTypes.has(body.type) ? body.type : 'browser';
+  const port = Number.parseInt(body.network?.port, 10);
+
+  return {
+    type,
+    network: {
+      host: String(body.network?.host || '').trim(),
+      port: Number.isInteger(port) && port > 0 && port <= 65535 ? port : 9100
+    },
+    paperWidth: allowedPaperWidths.has(body.paperWidth) ? body.paperWidth : '4x4',
+    autoPrintOnSale: Boolean(body.autoPrintOnSale),
+    printMode: allowedPrintModes.has(body.printMode) ? body.printMode : 'pdf',
+    lastSelectedAt: new Date(),
+    status: body.status || (type === 'browser' ? 'Configured' : 'Not configured'),
+    deviceLabel: String(body.deviceLabel || '').slice(0, 120),
+    lastTestedAt: body.lastTestedAt || null
+  };
+}
+
+function validateNetworkTarget({ host, port }) {
+  const cleanHost = String(host || '').trim();
+  const cleanPort = Number.parseInt(port, 10);
+
+  if (!cleanHost) return { error: 'Network printer IP is required.' };
+  if (/^https?:\/\//i.test(cleanHost)) return { error: 'Enter only the printer IP or hostname, without http:// or https://.' };
+  if (!Number.isInteger(cleanPort) || cleanPort < 1 || cleanPort > 65535) {
+    return { error: 'Network printer port must be between 1 and 65535.' };
+  }
+
+  return { host: cleanHost, port: cleanPort };
+}
+
+function isPrivateNetworkHost(host) {
+  return /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[0-1])\.|127\.|localhost$)/i.test(host);
+}
+
+function testNetworkSocket({ host, port, payload }) {
+  return new Promise((resolve, reject) => {
+    const socket = new net.Socket();
+    let settled = false;
+
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      callback(value);
+    };
+
+    socket.setTimeout(5000);
+    socket.once('connect', () => {
+      if (payload) {
+        socket.write(payload, () => finish(resolve, true));
+      } else {
+        finish(resolve, true);
+      }
+    });
+    socket.once('timeout', () => finish(reject, new Error('Connection timed out')));
+    socket.once('error', (error) => finish(reject, error));
+    socket.connect(port, host);
+  });
+}
 
 // ==========================================
 // HELPER: Transform Order Data for PDF Generation
@@ -156,6 +273,110 @@ function transformOrderForPrinting(order) {
     }]
   };
 }
+
+router.get('/printers/settings', auth, async (req, res) => {
+  try {
+    const tenantId = req.user.tenant_id || req.user.tenantId;
+    let settings = await Settings.findOne({ tenant_id: tenantId });
+
+    if (!settings) {
+      settings = new Settings({ tenant_id: tenantId });
+      await settings.save();
+    }
+
+    res.json({
+      success: true,
+      printerConnection: normalizePrinterConnection(settings.printingConfig?.printerConnection),
+      printingConfig: normalizePrintingConfig(settings.printingConfig)
+    });
+  } catch (error) {
+    console.error('Error fetching printer settings:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+router.post('/printers/settings', auth, async (req, res) => {
+  try {
+    const tenantId = req.user.tenant_id || req.user.tenantId;
+    const printerConnection = normalizePrinterPayload(req.body);
+
+    let settings = await Settings.findOne({ tenant_id: tenantId });
+    if (!settings) settings = new Settings({ tenant_id: tenantId });
+
+    const currentPrintingConfig = normalizePrintingConfig(settings.printingConfig);
+    settings.set('printingConfig.fromAddress', currentPrintingConfig.fromAddress);
+    settings.set('printingConfig.labelFormat', currentPrintingConfig.labelFormat);
+    settings.set('printingConfig.printerConnection', printerConnection);
+    settings.markModified('printingConfig');
+    await settings.save();
+
+    res.json({
+      success: true,
+      message: 'Printer settings saved successfully',
+      printerConnection
+    });
+  } catch (error) {
+    console.error('Error saving printer settings:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+router.post('/printers/test-network', auth, async (req, res) => {
+  try {
+    const target = validateNetworkTarget(req.body.network || req.body);
+    if (target.error) return res.status(400).json({ success: false, error: target.error });
+
+    await testNetworkSocket(target);
+
+    res.json({
+      success: true,
+      status: 'Connection test passed',
+      message: `Network printer is reachable at ${target.host}:${target.port}.`
+    });
+  } catch (error) {
+    const host = String(req.body.network?.host || req.body.host || '').trim();
+    const localHint = isPrivateNetworkHost(host)
+      ? ' If GoWhats is running on a cloud server, it cannot reach a local LAN printer directly. Use browser PDF printing or add a local print gateway on the same network as the printer.'
+      : '';
+
+    res.status(502).json({
+      success: false,
+      status: 'Printer not reachable',
+      error: `Printer not reachable: ${error.message}.${localHint}`
+    });
+  }
+});
+
+router.post('/printers/test-print', auth, async (req, res) => {
+  try {
+    const target = validateNetworkTarget(req.body.network || req.body);
+    if (target.error) return res.status(400).json({ success: false, error: target.error });
+
+    const testPayload = Buffer.from(
+      '\x1B@GoWhats Printer Test\nShipping label printing stays in browser PDF mode.\n\n\x1DVA\x00',
+      'binary'
+    );
+
+    await testNetworkSocket({ ...target, payload: testPayload });
+
+    res.json({
+      success: true,
+      status: 'Connection test passed',
+      message: 'Test print command sent to the network printer.'
+    });
+  } catch (error) {
+    const host = String(req.body.network?.host || req.body.host || '').trim();
+    const localHint = isPrivateNetworkHost(host)
+      ? ' If GoWhats is running on a cloud server, it cannot reach a local LAN printer directly. Use browser PDF printing or add a local print gateway on the same network as the printer.'
+      : '';
+
+    res.status(502).json({
+      success: false,
+      status: 'Printer not reachable',
+      error: `Test print failed: ${error.message}.${localHint}`
+    });
+  }
+});
 
 // ==========================================
 // 1. GET: Fetch Single Order for Printing
@@ -411,16 +632,13 @@ router.get('/settings', auth, async (req, res) => {
     if (!settings || !settings.printingConfig) {
       return res.json({
         success: true,
-        printingConfig: {
-          fromAddress: {},
-          labelFormat: 'thermal'
-        }
+        printingConfig: normalizePrintingConfig()
       });
     }
 
     res.json({
       success: true,
-      printingConfig: settings.printingConfig
+      printingConfig: normalizePrintingConfig(settings.printingConfig)
     });
 
   } catch (error) {
@@ -435,8 +653,7 @@ router.get('/settings', auth, async (req, res) => {
 router.post('/settings', auth, async (req, res) => {
   try {
     const tenantId = req.user.tenant_id;
-    const { fromAddress, labelFormat } = req.body;
-    const Settings = require('../models/settings');
+    const { fromAddress, labelFormat, printerConnection } = req.body;
 
     let settings = await Settings.findOne({ tenant_id: tenantId });
 
@@ -444,10 +661,13 @@ router.post('/settings', auth, async (req, res) => {
       settings = new Settings({ tenant_id: tenantId });
     }
 
-    settings.printingConfig = {
-      fromAddress: fromAddress || {},
-      labelFormat: labelFormat || 'thermal'
-    };
+    const currentPrintingConfig = normalizePrintingConfig(settings.printingConfig);
+    settings.set('printingConfig.fromAddress', normalizeFromAddress(fromAddress || currentPrintingConfig.fromAddress));
+    settings.set('printingConfig.labelFormat', normalizeLabelFormat(labelFormat || currentPrintingConfig.labelFormat));
+    settings.set(
+      'printingConfig.printerConnection',
+      printerConnection ? normalizePrinterPayload(printerConnection) : currentPrintingConfig.printerConnection
+    );
 
     settings.markModified('printingConfig');
     await settings.save();

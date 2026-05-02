@@ -108,18 +108,20 @@ const ApiKeys = () => {
     toast.success('API key copied to clipboard');
   };
 
-  const permissionOptions = [
-    { value: 'orders.read', label: 'Read Orders', description: 'View order details and list' },
-    { value: 'orders.write', label: 'Create Orders', description: 'Create new orders' },
-    { value: 'orders.update', label: 'Update Orders', description: 'Modify order status and details' },
-    { value: 'messages.read', label: 'Read Messages', description: 'View message history' },
-    { value: 'messages.send', label: 'Send Messages', description: 'Send WhatsApp messages' },
-    { value: 'contacts.read', label: 'Read Contacts', description: 'View contact information' },
-    { value: 'contacts.write', label: 'Write Contacts', description: 'Create and update contacts' },
-    { value: 'inventory.read', label: 'Read Inventory', description: 'View product catalog' },
-    { value: 'inventory.write', label: 'Write Inventory', description: 'Manage products' },
-    { value: 'webhooks.manage', label: 'Manage Webhooks', description: 'Configure webhook endpoints' }
-  ];
+const permissionOptions = [
+  { value: 'orders.read', label: 'Read Orders', description: 'View order details and list' },
+  { value: 'orders.write', label: 'Create Orders', description: 'Create new orders' },
+  { value: 'orders.update', label: 'Update Orders', description: 'Modify order status and details' },
+  { value: 'messages.read', label: 'Read Messages', description: 'View message history' },
+  { value: 'messages.send', label: 'Send Messages', description: 'Send WhatsApp messages' },
+  { value: 'contacts.read', label: 'Read Contacts', description: 'View contact information' },
+  { value: 'contacts.write', label: 'Write Contacts', description: 'Create and update contacts' },
+  { value: 'inventory.read', label: 'Read Inventory', description: 'View product catalog' },
+  { value: 'inventory.write', label: 'Write Inventory', description: 'Manage products' },
+  { value: 'webhooks.manage', label: 'Manage Webhooks', description: 'Configure webhook endpoints' },
+  { value: 'billing.read', label: 'Read Billing', description: 'View subscription and billing status' },
+  { value: 'transactions.read', label: 'Read Transactions', description: 'View Razorpay & Stripe transaction history' },
+];
 
   const togglePermission = (permission) => {
     setFormData(prev => ({

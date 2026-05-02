@@ -5,7 +5,9 @@ const OrderCounter = require('../models/OrderCounter');
 const ShippingMethod = require('../models/ShippingMethod');
 const { generateOrderId } = require('../utils/orderUtils');
 const auth = require('../middleware/auth');
+const authOrApiKey = require('../middleware/authOrApiKey');
 const { isEncryptionEnabled, hashPhone, normalizePhone, decryptFields, ORDER_ENCRYPTION_FIELDS } = require('../utils/encryption');
+const axios = require('axios');
 
 // Helper function to get tenant ID safely
 const getTenantId = (req) => {
@@ -26,13 +28,34 @@ const normalizeManualPaymentStatus = (status) => {
   return null;
 };
 
+async function syncOrderToBillingApp(order) {
+  try {
+    // Only sync if you have the Billing App URL and Secret
+    if (!process.env.BILLING_SAAS_URL || !process.env.SYNC_SECRET) return;
+
+    for (const item of order.items) {
+      await axios.post(`${process.env.BILLING_SAAS_URL}/api/webhooks/gowhats/inventory`, {
+        sku: item.sku || item.retailerId, // Ensure this matches your Billing App SKU field
+        quantity: item.quantity,          // Only send the quantity for THIS item
+        organisationId: order.tenantId,
+        orderId: order.orderId
+      }, {
+        headers: { 'x-sync-secret': process.env.SYNC_SECRET }
+      });
+      console.log(`Sync success for SKU: ${item.sku}`);
+    }
+  } catch (error) {
+    console.error("Billing App Sync Failed:", error.message);
+  }
+}
+
 // ==========================================
 // 1. ORDER LISTING & MANAGEMENT ROUTES
 // ==========================================
 
 // Get all orders for tenant (ENHANCED VERSION - ONLY ONE!)
-router.get('/', auth, async (req, res) => {
-  try {
+router.get('/', authOrApiKey(['orders.read']), async (req, res) => {
+try {
     const {
       page = 1,
       limit = 50,
@@ -145,8 +168,8 @@ router.get('/registrations', auth, async (req, res) => {
 });
 
 // Get single order
-router.get('/:orderId', auth, async (req, res) => {
-  try {
+router.get('/:orderId', authOrApiKey(['orders.read']), async (req, res) => {
+try {
     const order = await Order.findOne({
       tenantId: req.user.tenant_id,
       orderId: req.params.orderId
@@ -303,8 +326,8 @@ router.get('/counter/stats', auth, async (req, res) => {
 // 3. ORDER CREATION & UPDATES
 // ==========================================
 
-router.post('/create', auth, async (req, res) => {
-  try {
+router.post('/create', authOrApiKey(['orders.write']), async (req, res) => {
+try {
     const tenantId = getTenantId(req);
     const orderData = req.body;
     const orderId = await generateOrderId(tenantId.toString());
@@ -404,7 +427,11 @@ router.post('/manual', auth, async (req, res) => {
         price,
         totalPrice: quantity * price,
         sku: String(item?.sku || '').trim(),
-        retailerId: String(item?.retailerId || item?.sku || '').trim(),
+        retailerId: String(item?.retailerId || item?.retailer_id || item?.sku || '').trim(),
+        color: String(item?.color || '').trim(),
+        size: String(item?.size || '').trim(),
+        variantGroup: String(item?.variantGroup || item?.variant_group || '').trim(),
+        variantLabel: String(item?.variantLabel || item?.variant_label || '').trim(),
         inventoryItemId: (typeof item?.inventoryItemId === 'string' && /^[0-9a-fA-F]{24}$/.test(item.inventoryItemId))
           ? item.inventoryItemId
           : undefined,
@@ -485,6 +512,10 @@ router.post('/manual', auth, async (req, res) => {
 
     await newOrder.save();
 
+    if (newOrder.paymentStatus === 'completed') {
+      await syncOrderToBillingApp(newOrder);
+    }
+    
     return res.status(201).json({
       success: true,
       message: 'Manual order created successfully',
@@ -544,6 +575,10 @@ router.patch('/:orderId/payment-status', auth, async (req, res) => {
     }
 
     await order.save();
+    if (newStatus === 'completed') {
+      await syncOrderToBillingApp(order);
+    }
+
     console.log(`💰 Payment status updated for Order ${orderId}: ${newStatus}`);
 
     res.json({ success: true, message: 'Payment status updated', order });

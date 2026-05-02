@@ -40,9 +40,11 @@
                 "openai": "^5.16.0",
                 "papaparse": "^5.5.3",
                 "qrcode": "^1.5.4",
+                "razorpay": "^2.9.6",
                 "socket.io": "^4.8.1",
-                "stripe": "^20.1.0",
+                "stripe": "^20.4.1",
                 "uuid": "^9.0.1",
+                "web-push": "^3.6.7",
                 "woocommerce-api": "^1.5.0",
                 "ws": "^8.18.0",
                 "xlsx": "^0.18.5"

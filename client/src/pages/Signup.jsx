@@ -21,9 +21,9 @@ import { COUNTRIES, defaultCountry } from '../utils/countries';
 import AuthLayout from '../components/AuthLayout';
 import { motion, AnimatePresence } from 'framer-motion';
 import logo from '../images/golo1.png';
+import { storeTenant, safeRedirect } from '../utils/auth';
 
-const GOOGLE_CLIENT_ID =
-  '939627024065-0fure8e4mbmmsdb4ubu214f17n3v4749.apps.googleusercontent.com';
+const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID;
 
 const loadGoogleScript = () =>
   new Promise((resolve) => {
@@ -36,32 +36,6 @@ const loadGoogleScript = () =>
     s.onload = resolve;
     document.head.appendChild(s);
   });
-
-const decodeGoogleJWT = (token) => {
-  try {
-    const parts = token.split('.');
-    if (parts.length < 2) return null;
-    const b = parts[1].replace(/-/g, '+').replace(/_/g, '/');
-    return JSON.parse(atob(b.padEnd(b.length + ((4 - (b.length % 4)) % 4), '=')));
-  } catch {
-    return null;
-  }
-};
-
-const storeTenant = (token) => {
-  try {
-    const parts = token.split('.');
-    if (parts.length < 2) return;
-    const b = parts[1].replace(/-/g, '+').replace(/_/g, '/');
-    const p = JSON.parse(atob(b.padEnd(b.length + ((4 - (b.length % 4)) % 4), '=')));
-    const id = p.tenant_id || p.tenantId;
-    if (id) {
-      ['tenentid', 'tenantid', 'tenant_id', 'tenantId', 'x-tenant-id'].forEach((k) =>
-        localStorage.setItem(k, id)
-      );
-    }
-  } catch {}
-};
 
 const normalizeReferralCode = (value) =>
   String(value || '')
@@ -773,40 +747,49 @@ export function SignUp() {
   }, [searchParams]);
 
   const handleGoogle = useCallback(
-    async (response) => {
-      try {
-        const payload = decodeGoogleJWT(response.credential);
-        if (!payload) return toast.error('Invalid Google token');
+	  async (response) => {
+	    try {
+	      // Decode JWT payload to get name/email for pending data
+	      // (server will cryptographically verify the credential)
+	      let payload = null;
+	      try {
+	        const parts = response.credential.split('.');
+	        const b = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+	        payload = JSON.parse(atob(b.padEnd(b.length + ((4 - b.length % 4) % 4), '=')));
+	      } catch {
+	        return toast.error('Invalid Google token');
+	      }
+	      if (!payload?.email) return toast.error('Invalid Google token');
 
-        try {
-          await publicApi.post('/api/auth/google', { credential: response.credential });
-          toast.success('Account already exists. Please sign in.');
-          navigate('/login');
-          return;
-        } catch (err) {
-          if (err.response?.status !== 404) {
-            toast.error(err.response?.data?.message || 'Google error');
-            return;
-          }
-        }
+	      try {
+	        await publicApi.post('/api/auth/google', { credential: response.credential });
+	        toast.success('Account already exists. Please sign in.');
+	        navigate('/login');
+	        return;
+	      } catch (err) {
+	        if (err.response?.status !== 404) {
+	          toast.error(err.response?.data?.message || 'Google error');
+	          return;
+	        }
+	      }
 
-        setPendingData({
-          method: 'google',
-          credential: response.credential,
-          email: payload.email,
-          name: payload.name,
-          referral_code: referralCode
-        });
-        setSignupMethod('google');
-        setStage('phone_verify');
-      } catch {
-        toast.error('Google sign-up failed');
-      }
-    },
-    [navigate, referralCode]
-  );
+	      setPendingData({
+	        method: 'google',
+	        credential: response.credential,
+	        email: payload.email,
+	        name: payload.name,
+	        referral_code: referralCode
+	      });
+	      setSignupMethod('google');
+	      setStage('phone_verify');
+	    } catch {
+	      toast.error('Google sign-up failed');
+	    }
+	  },
+	  [navigate, referralCode]
+	);
 
-  const triggerGoogle = useCallback(() => {
+    const triggerGoogle = useCallback(() => {
     loadGoogleScript().then(() => {
       if (!window.google) return toast.error('Google not ready, please try again');
       if (!googleInitialized.current) {
@@ -843,68 +826,70 @@ export function SignUp() {
   };
 
   const handlePhoneVerified = async ({ phone, otp }) => {
-    try {
-      let token = null;
-      let redirectUrl = null;
-      const syncToken = sessionStorage.getItem('billzzy_sync_token');
+  try {
+    let token = null;
+    let redirectUrl = null;
 
-      if (signupMethod === 'google') {
-        const res = await publicApi.post('/api/auth/google/register', {
-          credential: pendingData.credential,
-          phone_number: phone,
-          otp,
-          referral_code: pendingData.referral_code,
-          integrationToken: syncToken
-        });
-        token = res.data.access_token || res.data.token;
-        redirectUrl = res.data.redirectUrl;
+    // Read and immediately remove — don't leave it sitting in sessionStorage
+    const syncToken = sessionStorage.getItem('billzzy_sync_token');
+    if (syncToken) sessionStorage.removeItem('billzzy_sync_token');
 
-        if (!token) {
-          const loginRes = await publicApi.post('/api/auth/google', {
-            credential: pendingData.credential
-          });
-          token = loginRes.data.access_token || loginRes.data.token;
-        }
-      } else if (signupMethod === 'email') {
-        const res = await publicApi.post('/api/auth/register', {
-          name: pendingData.name,
-          email: pendingData.email,
-          password: pendingData.password,
-          company_name: pendingData.company_name,
-          phone_number: phone,
-          otp,
-          referral_code: pendingData.referral_code,
-          integrationToken: syncToken
-        });
-        redirectUrl = res.data.redirectUrl;
+    if (signupMethod === 'google') {
+      const res = await publicApi.post('/api/auth/google/register', {
+        credential: pendingData.credential,
+        phone_number: phone,
+        otp,
+        referral_code: pendingData.referral_code,
+        integrationToken: syncToken
+      });
+      token = res.data.access_token || res.data.token;
+      redirectUrl = res.data.redirectUrl;
 
-        const loginRes = await publicApi.post('/api/auth/login', {
-          email: pendingData.email,
-          password: pendingData.password
+      if (!token) {
+        const loginRes = await publicApi.post('/api/auth/google', {
+          credential: pendingData.credential
         });
         token = loginRes.data.access_token || loginRes.data.token;
       }
+    } else if (signupMethod === 'email') {
+      const res = await publicApi.post('/api/auth/register', {
+        name: pendingData.name,
+        email: pendingData.email,
+        password: pendingData.password,
+        company_name: pendingData.company_name,
+        phone_number: phone,
+        otp,
+        referral_code: pendingData.referral_code,
+        integrationToken: syncToken
+      });
+      redirectUrl = res.data.redirectUrl;
 
-      if (token) {
-        storeTenant(token);
-        if (login(token)) {
-          if (redirectUrl) {
-            sessionStorage.removeItem('billzzy_sync_token'); // Clean up
-            window.location.href = redirectUrl; // Teleport to Billzzy!
-            return;
-          }
-          toast.success('Welcome to GoWhats! 🎉');
-          navigate('/admin');
+      const loginRes = await publicApi.post('/api/auth/login', {
+        email: pendingData.email,
+        password: pendingData.password
+      });
+      token = loginRes.data.access_token || loginRes.data.token;
+    }
+
+    if (token) {
+      storeTenant(token);
+      if (login(token)) {
+        if (redirectUrl) {
+          safeRedirect(redirectUrl); // safe redirect instead of window.location.href
           return;
         }
+        toast.success('Welcome to GoWhats! 🎉');
+        navigate('/admin');
+        return;
       }
-
-      toast.success('Account created! Please sign in.');
-      navigate('/login');
-    } catch (err) {
-      toast.error(err.response?.data?.message || 'Registration failed');
     }
-  };
+
+    toast.success('Account created! Please sign in.');
+    navigate('/login');
+  } catch (err) {
+    toast.error(err.response?.data?.message || 'Registration failed');
+  }
+};
 
   const panelContent = (
     <div className="flex flex-col items-center text-center space-y-7">

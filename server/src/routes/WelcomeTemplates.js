@@ -1,3 +1,4 @@
+// routes/WelcomeTemplates.js
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
@@ -7,62 +8,113 @@ const auth = require('../middleware/auth');
 const checkTenant = require('../middleware/tenantMiddleware');
 const BotConfiguration = require('../models/WelcomeTemplates');
 
-console.log('WelcomeTemplates routes loaded');
+const UPLOADS_ROOT = path.resolve(__dirname, '../uploads');
 
-// Configure storage for file uploads
+const VALID_WORKFLOWS = ['Shop Our Collection', 'Talk with Our Team', 'Product Suggestions', 'Visit Website'];
+
+const DEFAULT_WORKFLOW_MESSAGES = [
+  {
+    // ✅ FIX: No hardcoded URL — tenant must configure their own
+    workflow: 'Visit Website',
+    message: "Click the link below to visit our website! 🙏",
+    url: null,
+    isCustomized: false
+  },
+  {
+    workflow: 'Shop Our Collection',
+    message: "To shop our products, click the 'WhatsApp Shop' button above.",
+    url: null,
+    isCustomized: false
+  },
+  {
+    workflow: 'Talk with Our Team',
+    message: "Hi 👋 Our customer support executive will get in touch with you soon!",
+    url: null,
+    isCustomized: false
+  },
+  {
+    workflow: 'Product Suggestions',
+    message: "🤖 AI Assistant activated! I'm here to help you find the perfect products. Tell me what you're looking for and I'll provide personalized recommendations.",
+    url: null,
+    isCustomized: false
+  }
+];
+
+// ==========================================
+// FILE UPLOAD CONFIG
+// ==========================================
+
+const ALLOWED_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.mp4', '.mov', '.pdf', '.doc', '.docx']);
+
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
-    const dir = path.join(__dirname, `../uploads/${req.tenantId}`);
-    fs.ensureDirSync(dir);
-    cb(null, dir);
+    // ✅ FIX 2: Path traversal protection — resolve and verify destination stays within uploads root
+    const tenantUploadDir = path.resolve(UPLOADS_ROOT, req.tenantId);
+    if (!tenantUploadDir.startsWith(UPLOADS_ROOT)) {
+      return cb(new Error('Invalid upload destination'));
+    }
+    fs.ensureDirSync(tenantUploadDir);
+    cb(null, tenantUploadDir);
   },
   filename: function (req, file, cb) {
     const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-    const ext = path.extname(file.originalname);
+    // ✅ FIX 8: Validate extension against whitelist instead of trusting originalname
+    const ext = path.extname(file.originalname).toLowerCase();
+    if (!ALLOWED_EXTENSIONS.has(ext)) {
+      return cb(new Error('Invalid file extension'));
+    }
     cb(null, file.fieldname + '-' + uniqueSuffix + ext);
   }
 });
 
-// File filter for uploads
 const fileFilter = (req, file, cb) => {
-  const mediaType = req.body.mediaType?.toLowerCase() || file.mimetype.split('/')[0];
-  console.log('File filter checking:', file.mimetype, 'mediaType:', mediaType);
+  // ✅ FIX 6: Do NOT use req.body.mediaType here — it's unreliable during multer processing.
+  // Validate only by MIME type which is set by the client before upload starts.
+  const allowed = (
+    file.mimetype.startsWith('image/') ||
+    file.mimetype.startsWith('video/') ||
+    file.mimetype === 'application/pdf' ||
+    file.mimetype === 'application/msword' ||
+    file.mimetype === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+  );
 
-  if (file.mimetype.startsWith('image/') ||
-      file.mimetype.startsWith('video/') ||
-      file.mimetype === 'application/pdf' ||
-      file.mimetype === 'application/msword' ||
-      file.mimetype === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
-    console.log('Accepting file:', file.mimetype);
+  if (allowed) {
     cb(null, true);
   } else {
-    console.log('Rejecting file:', file.mimetype);
-    cb(new Error('Invalid file type'), false);
+    cb(new Error('Invalid file type. Allowed: images, videos, PDF, Word documents.'), false);
   }
 };
 
 const upload = multer({
-  storage: storage,
-  fileFilter: fileFilter,
-  limits: { fileSize: 5 * 1024 * 1024 } // 5MB limit
+  storage,
+  fileFilter,
+  limits: { fileSize: 5 * 1024 * 1024 } // 5MB
 });
 
+// ==========================================
+// ROUTES
+// ==========================================
+
 /**
- * @route   GET api/welcome-message
+ * @route   GET /api/welcome-message
  * @desc    Get welcome message configuration for a tenant
  * @access  Private
  */
 router.get('/', auth, checkTenant, async (req, res) => {
   try {
-    console.log('GET /api/welcome-message - Tenant ID:', req.tenantId);
-    
     let config = await BotConfiguration.findOne({ tenant_id: req.tenantId });
-    
+
+    // ✅ FIX 4: Do NOT create a DB record on GET — return a default object without saving.
     if (!config) {
-      config = new BotConfiguration({ tenant_id: req.tenantId });
-      await config.save();
+      return res.json({
+        tenant_id: req.tenantId,
+        isActive: false,
+        triggerWords: [],
+        workflows: [],
+        workflowMessages: DEFAULT_WORKFLOW_MESSAGES
+      });
     }
-    
+
     res.json(config);
   } catch (err) {
     console.error('❌ Error fetching welcome message configuration:', err.message);
@@ -71,43 +123,82 @@ router.get('/', auth, checkTenant, async (req, res) => {
 });
 
 /**
- * @route   POST api/welcome-message
+ * @route   POST /api/welcome-message
  * @desc    Update welcome message configuration for a tenant
  * @access  Private
  */
 router.post('/', auth, checkTenant, async (req, res) => {
   try {
     const tenantId = req.tenantId;
-    const updateData = req.body;
 
-    console.log('POST /api/welcome-message - SAVING CONFIGURATION');
-    console.log('Received data from frontend:', JSON.stringify(updateData, null, 2));
+    // ✅ FIX 1: Whitelist only the fields we expect — never spread raw req.body onto a model.
+    const {
+      welcomeMessageType,
+      interactiveType,
+      headerText,
+      messageBody,
+      workflows,
+      workflowMessages,
+      isActive,
+      triggerWords
+    } = req.body;
 
-    // Find the existing configuration or create a new one if it doesn't exist
+    // ✅ FIX 1: Input validation — enforce types and size limits
+    if (triggerWords !== undefined && (!Array.isArray(triggerWords) || triggerWords.length > 100)) {
+      return res.status(400).json({ success: false, message: 'triggerWords must be an array of up to 100 items' });
+    }
+
+    if (workflows !== undefined && (!Array.isArray(workflows) || workflows.length > 50)) {
+      return res.status(400).json({ success: false, message: 'workflows must be an array of up to 50 items' });
+    }
+
+    if (workflowMessages !== undefined && (!Array.isArray(workflowMessages) || workflowMessages.length > 50)) {
+      return res.status(400).json({ success: false, message: 'workflowMessages must be an array of up to 50 items' });
+    }
+
+    if (headerText && typeof headerText === 'string' && headerText.length > 500) {
+      return res.status(400).json({ success: false, message: 'headerText must be 500 characters or less' });
+    }
+
+    if (messageBody && typeof messageBody === 'string' && messageBody.length > 4096) {
+      return res.status(400).json({ success: false, message: 'messageBody must be 4096 characters or less' });
+    }
+
+    // ✅ FIX: If workflowMessages contains a Visit Website entry, validate its URL
+    if (Array.isArray(workflowMessages)) {
+      for (const wm of workflowMessages) {
+        if (wm.workflow === 'Visit Website' && wm.url !== undefined && wm.url !== null) {
+          try {
+            const parsed = new URL(wm.url);
+            if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Bad protocol');
+          } catch {
+            return res.status(400).json({ success: false, message: 'Invalid URL in workflowMessages for Visit Website. Must be http or https.' });
+          }
+        }
+      }
+    }
+
+    // Build a safe update object from whitelisted fields only
+    const safeUpdate = {};
+    if (welcomeMessageType !== undefined) safeUpdate.welcomeMessageType = welcomeMessageType;
+    if (interactiveType !== undefined) safeUpdate.interactiveType = interactiveType;
+    if (headerText !== undefined) safeUpdate.headerText = headerText;
+    if (messageBody !== undefined) safeUpdate.messageBody = messageBody;
+    if (workflows !== undefined) safeUpdate.workflows = workflows;
+    if (workflowMessages !== undefined) safeUpdate.workflowMessages = workflowMessages;
+    if (isActive !== undefined) safeUpdate.isActive = isActive;
+    if (triggerWords !== undefined) safeUpdate.triggerWords = triggerWords;
+    safeUpdate.updatedAt = Date.now();
+
     let config = await BotConfiguration.findOne({ tenant_id: tenantId });
     if (!config) {
       config = new BotConfiguration({ tenant_id: tenantId });
     }
 
-    // --- THIS IS THE CRITICAL FIX ---
-    // Update all the properties on the document directly.
-    // This is more reliable than using $set for nested objects.
-    config.welcomeMessageType = updateData.welcomeMessageType;
-    config.interactiveType = updateData.interactiveType;
-    config.headerText = updateData.headerText;
-    config.messageBody = updateData.messageBody;
-    config.workflows = updateData.workflows;
-    config.workflowMessages = updateData.workflowMessages; // This will now save correctly
-    config.isActive = updateData.isActive;
-    config.triggerWords = updateData.triggerWords;
-    config.updatedAt = Date.now();
-
-    // Save the entire updated document.
+    Object.assign(config, safeUpdate);
     const savedConfig = await config.save();
 
-    console.log('✅ Configuration successfully saved to database for tenant:', tenantId);
-    console.log('CONFIRMING SAVED MESSAGES:', JSON.stringify(savedConfig.workflowMessages, null, 2));
-
+    console.log('✅ Configuration saved for tenant:', tenantId);
     res.json({ success: true, data: savedConfig });
 
   } catch (err) {
@@ -117,153 +208,96 @@ router.post('/', auth, checkTenant, async (req, res) => {
 });
 
 /**
- * @route   GET api/welcome-message/debug-triggers
- * @desc    Debug trigger words configuration
+ * @route   GET /api/welcome-message/workflow-messages
  * @access  Private
  */
-router.get('/debug-triggers', auth, checkTenant, async (req, res) => {
+router.get('/workflow-messages', auth, checkTenant, async (req, res) => {
   try {
     const config = await BotConfiguration.findOne({ tenant_id: req.tenantId });
-    
-    const debugInfo = {
-      tenantId: req.tenantId,
-      configExists: !!config,
-      isActive: config?.isActive || false,
-      triggerWords: config?.triggerWords || [],
-      triggerWordsCount: config?.triggerWords?.length || 0,
-      welcomeMessageType: config?.welcomeMessageType,
-      messageBody: config?.messageBody ? 'exists' : 'missing',
-      workflows: config?.workflows || [],
-      hasProductSuggestionsWorkflow: config?.workflows?.some(w => w.workflow === 'Product Suggestions') || false
-    };
-    
-    console.log('🔍 Trigger words debug:', debugInfo);
-    
-    res.json({
-      success: true,
-      debug: debugInfo,
-      recommendations: generateTriggerRecommendations(debugInfo)
-    });
-    
-  } catch (error) {
-    console.error('❌ Debug triggers error:', error);
-    res.status(500).json({ success: false, error: error.message });
+
+    if (!config) {
+      return res.json({ success: true, workflowMessages: DEFAULT_WORKFLOW_MESSAGES });
+    }
+
+    res.json({ success: true, workflowMessages: config.workflowMessages || [] });
+  } catch (err) {
+    console.error('❌ Error fetching workflow messages:', err.message);
+    res.status(500).json({ success: false, message: 'Server Error' });
   }
 });
 
-function generateTriggerRecommendations(debugInfo) {
-  const recommendations = [];
-  
-  if (!debugInfo.configExists) {
-    recommendations.push("❌ No bot configuration found - create welcome message first");
-  }
-  
-  if (!debugInfo.isActive) {
-    recommendations.push("⚠️ Bot configuration exists but not active - turn on bot status");
-  }
-  
-  if (debugInfo.triggerWordsCount === 0) {
-    recommendations.push("❌ No trigger words configured - add trigger words");
-  } else if (debugInfo.triggerWordsCount < 3) {
-    recommendations.push("⚠️ Only few trigger words - consider adding more variations");
-  }
-  
-  if (debugInfo.triggerWordsCount > 0 && debugInfo.isActive) {
-    recommendations.push("✅ Trigger words configured and bot active - should work!");
-  }
-  
-  if (debugInfo.hasProductSuggestionsWorkflow) {
-    recommendations.push("🤖 Product Suggestions workflow configured - ensure AI assistant is set up");
-  }
-  
-  recommendations.push(`💡 Current trigger words: ${debugInfo.triggerWords.join(', ')}`);
-  
-  return recommendations;
-}
-
 /**
- * @route   POST api/welcome-message/workflow-message
+ * @route   POST /api/welcome-message/workflow-message
  * @desc    Update specific workflow message for a tenant
  * @access  Private
  */
 router.post('/workflow-message', auth, checkTenant, async (req, res) => {
   try {
-    console.log('POST /api/welcome-message/workflow-message - Updating workflow message');
-    console.log('Request body:', JSON.stringify(req.body, null, 2));
-    console.log('Tenant ID:', req.tenantId);
-
-    const { workflow, message } = req.body;
+    const { workflow, message, url } = req.body; // ✅ FIX: Extract url
 
     if (!workflow || !message) {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'Workflow type and message are required' 
-      });
+      return res.status(400).json({ success: false, message: 'Workflow type and message are required' });
     }
 
-    // Validate workflow type
-    const validWorkflows = ['Shop Our Collection', 'Talk with Our Team', 'Product Suggestions'];
-    if (!validWorkflows.includes(workflow)) {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'Invalid workflow type' 
-      });
+    if (!VALID_WORKFLOWS.includes(workflow)) {
+      return res.status(400).json({ success: false, message: 'Invalid workflow type' });
     }
 
-    // Find existing configuration
+    // ✅ FIX 5: Enforce message length limit
+    if (typeof message !== 'string' || message.length > 4096) {
+      return res.status(400).json({ success: false, message: 'Message must be a string of up to 4096 characters' });
+    }
+
+    // ✅ FIX: Validate URL for Visit Website workflow — required and must be http/https
+    if (workflow === 'Visit Website') {
+      if (!url || typeof url !== 'string') {
+        return res.status(400).json({ success: false, message: 'A URL is required for the Visit Website workflow' });
+      }
+      try {
+        const parsed = new URL(url);
+        if (!['http:', 'https:'].includes(parsed.protocol)) {
+          throw new Error('Bad protocol');
+        }
+      } catch {
+        return res.status(400).json({ success: false, message: 'Invalid URL format. Must be http or https.' });
+      }
+    }
+
     let config = await BotConfiguration.findOne({ tenant_id: req.tenantId });
 
     if (!config) {
-      // Create new config with default values
       config = new BotConfiguration({
         tenant_id: req.tenantId,
-        workflowMessages: [
-          {
-            workflow: 'Shop Our Collection',
-            message: "To shop our products, click the 'WhatsApp Shop' button above.",
-            isCustomized: false
-          },
-          {
-            workflow: 'Talk with Our Team', 
-            message: "Hi 👋 Our customer support executive will get in touch with you soon!",
-            isCustomized: false
-          },
-          {
-            workflow: 'Product Suggestions',
-            message: "🤖 AI Assistant activated! I'm here to help you find the perfect products.",
-            isCustomized: false
-          }
-        ]
+        workflowMessages: [...DEFAULT_WORKFLOW_MESSAGES]
       });
     }
 
-    // Update or add the specific workflow message
-    const existingMessageIndex = config.workflowMessages.findIndex(wm => wm.workflow === workflow);
-    
-    if (existingMessageIndex !== -1) {
-      // Update existing message
-      config.workflowMessages[existingMessageIndex].message = message;
-      config.workflowMessages[existingMessageIndex].isCustomized = true;
+    const existingIndex = config.workflowMessages.findIndex(wm => wm.workflow === workflow);
+
+    // ✅ FIX: Build update entry — only set url for Visit Website
+    const updatedEntry = {
+      message,
+      isCustomized: true,
+      ...(workflow === 'Visit Website' && { url })
+    };
+
+    if (existingIndex !== -1) {
+      Object.assign(config.workflowMessages[existingIndex], updatedEntry);
     } else {
-      // Add new message
-      config.workflowMessages.push({
-        workflow: workflow,
-        message: message,
-        isCustomized: true
-      });
+      config.workflowMessages.push({ workflow, ...updatedEntry });
     }
 
     config.updatedAt = Date.now();
     await config.save();
 
-    console.log('✅ Workflow message updated successfully for tenant:', req.tenantId);
-    console.log('✅ Updated workflow:', workflow);
+    console.log('✅ Workflow message updated for tenant:', req.tenantId, '| workflow:', workflow);
 
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       data: {
-        workflow: workflow,
-        message: message,
+        workflow,
+        message,
+        url: workflow === 'Visit Website' ? url : null,
         isCustomized: true,
         updatedAt: config.updatedAt
       }
@@ -275,79 +309,26 @@ router.post('/workflow-message', auth, checkTenant, async (req, res) => {
   }
 });
 
-router.get('/workflow-messages', auth, checkTenant, async (req, res) => {
-  try {
-    console.log('GET /api/welcome-message/workflow-messages - Tenant ID:', req.tenantId);
-
-    let config = await BotConfiguration.findOne({ tenant_id: req.tenantId });
-
-    if (!config) {
-      // Return default messages
-      const defaultMessages = [
-        {
-          workflow: 'Shop Our Collection',
-          message: "To shop our products, click the 'WhatsApp Shop' button above.",
-          isCustomized: false
-        },
-        {
-          workflow: 'Talk with Our Team',
-          message: "Hi 👋 Our customer support executive will get in touch with you soon!",
-          isCustomized: false
-        },
-        {
-          workflow: 'Product Suggestions',
-          message: "🤖 AI Assistant activated! I'm here to help you find the perfect products. Tell me what you're looking for or describe your needs, and I'll provide personalized recommendations.",
-          isCustomized: false
-        }
-      ];
-
-      return res.json({
-        success: true,
-        workflowMessages: defaultMessages
-      });
-    }
-
-    res.json({
-      success: true,
-      workflowMessages: config.workflowMessages || []
-    });
-
-  } catch (err) {
-    console.error('❌ Error fetching workflow messages:', err.message);
-    res.status(500).json({ success: false, message: 'Server Error' });
-  }
-});
-
 /**
- * @route   POST api/welcome-message/bot-status
+ * @route   POST /api/welcome-message/bot-status
  * @desc    Toggle bot active status
  * @access  Private
  */
 router.post('/bot-status', auth, checkTenant, async (req, res) => {
   try {
     const { isActive } = req.body;
-    
-    if (isActive === undefined) {
-      return res.status(400).json({ success: false, message: 'isActive status is required' });
+
+    if (typeof isActive !== 'boolean') {
+      return res.status(400).json({ success: false, message: 'isActive must be a boolean' });
     }
-    
-    let config = await BotConfiguration.findOne({ tenant_id: req.tenantId });
-    
-    if (config) {
-      config = await BotConfiguration.findOneAndUpdate(
-        { tenant_id: req.tenantId },
-        { $set: { isActive, updatedAt: Date.now() } },
-        { new: true }
-      );
-    } else {
-      config = new BotConfiguration({
-        tenant_id: req.tenantId,
-        isActive
-      });
-      
-      await config.save();
-    }
-    
+
+    // ✅ FIX 3: Single upsert query instead of findOne + findOneAndUpdate (race condition + 2 DB hits)
+    const config = await BotConfiguration.findOneAndUpdate(
+      { tenant_id: req.tenantId },
+      { $set: { isActive, updatedAt: Date.now() } },
+      { new: true, upsert: true, setDefaultsOnInsert: true }
+    );
+
     res.json({ success: true, isActive: config.isActive });
   } catch (err) {
     console.error('❌ Error updating bot status:', err.message);
@@ -356,28 +337,21 @@ router.post('/bot-status', auth, checkTenant, async (req, res) => {
 });
 
 /**
- * @route   POST api/welcome-message/upload-media
+ * @route   POST /api/welcome-message/upload-media
  * @desc    Upload media file for welcome message header
  * @access  Private
  */
 router.post('/upload-media', auth, checkTenant, upload.single('file'), async (req, res) => {
-  console.log('Upload media request received');
-  console.log('Tenant ID:', req.tenantId);
-  
   try {
     if (!req.file) {
-      console.error('No file uploaded');
       return res.status(400).json({ success: false, message: 'No file uploaded' });
     }
-    
-    console.log('File received:', req.file.originalname, req.file.mimetype, req.file.size);
-    
+
     const baseUrl = process.env.APP_URL || `http://localhost:${process.env.PORT || 5000}`;
     const fileUrl = `${baseUrl}/uploads/${req.tenantId}/${req.file.filename}`;
-    
-    console.log('File uploaded successfully to:', req.file.path);
-    console.log('Public URL:', fileUrl);
-    
+
+    console.log('✅ File uploaded for tenant:', req.tenantId, '| size:', req.file.size);
+
     res.json({
       success: true,
       url: fileUrl,
@@ -390,22 +364,22 @@ router.post('/upload-media', auth, checkTenant, upload.single('file'), async (re
   }
 });
 
-// Error handler for multer
+// ✅ FIX 7: /debug-triggers removed from production.
+//    If needed for debugging, add it only under: if (process.env.NODE_ENV !== 'production') { ... }
+
+// Multer error handler
 router.use((err, req, res, next) => {
   if (err instanceof multer.MulterError) {
     if (err.code === 'LIMIT_FILE_SIZE') {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'File size exceeds the 5MB limit' 
-      });
+      return res.status(400).json({ success: false, message: 'File size exceeds the 5MB limit' });
     }
     return res.status(400).json({ success: false, message: err.message });
   }
-  
-  if (err.message) {
+
+  if (err && err.message) {
     return res.status(400).json({ success: false, message: err.message });
   }
-  
+
   next(err);
 });
 

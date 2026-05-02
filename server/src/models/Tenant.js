@@ -128,6 +128,17 @@ const tenantSchema = new mongoose.Schema({
       createdAt: Date,
       paidAt: Date
     },
+    shopify: {
+      subscriptionId: String,
+      name: String,
+      amount: Number,
+      currency: String,
+      status: String,
+      test: { type: Boolean, default: false },
+      currentPeriodEnd: Date,
+      createdAt: Date,
+      activatedAt: Date
+    },
     history: [{
       provider: { type: String, default: 'manual' },
       event: { type: String, default: 'payment_recorded' },

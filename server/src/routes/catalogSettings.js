@@ -4,6 +4,10 @@ const Settings = require('../models/settings');
 const OrderCounter = require('../models/OrderCounter');
 const auth = require('../middleware/auth');
 
+function normalizeLabelFormat(labelFormat) {
+  return ['thermal', 'thermal6', 'a4'].includes(labelFormat) ? labelFormat : 'thermal';
+}
+
 /**
  * GET /api/catalog-settings
  */
@@ -33,7 +37,15 @@ router.get('/', auth, async (req, res) => {
       automationConfig: settings.automationConfig,
       printingConfig: settings.printingConfig || {
         fromAddress: {},
-        labelFormat: 'thermal'
+        labelFormat: 'thermal',
+        printerConnection: {
+          type: 'browser',
+          network: { host: '', port: 9100 },
+          paperWidth: '4x4',
+          autoPrintOnSale: false,
+          printMode: 'pdf',
+          status: 'Not configured'
+        }
       }, // ✅ Ensure printingConfig is always returned
       settings: settings,
       orderCounter: counter?.nextOrderNumber || 1000
@@ -183,9 +195,26 @@ router.post('/', auth, async (req, res) => {
       // Handle printingConfig
       if (printingConfig) {
         console.log('💾 Saving printingConfig:', printingConfig);
+        const existingPrintingConfig = settings.printingConfig?.toObject?.() || settings.printingConfig || {};
+        const existingFromAddress = existingPrintingConfig.fromAddress || {};
+        const nextFromAddress = printingConfig.fromAddress || existingFromAddress;
         settings.printingConfig = {
-          fromAddress: printingConfig.fromAddress || {},
-          labelFormat: printingConfig.labelFormat || 'thermal'
+           ...existingPrintingConfig,
+          fromAddress: {
+            name: nextFromAddress.name || '',
+            address1: nextFromAddress.address1 || '',
+            address2: nextFromAddress.address2 || '',
+            city: nextFromAddress.city || '',
+            state: nextFromAddress.state || '',
+            zipCode: nextFromAddress.zipCode || '',
+            phone: nextFromAddress.phone || ''
+          },
+          labelFormat: normalizeLabelFormat(printingConfig.labelFormat || existingPrintingConfig.labelFormat),
+          printerConnection: {
+            ...(existingPrintingConfig.printerConnection || {}),
+            ...(printingConfig.printerConnection || {})
+          }
+
         };
       }
 

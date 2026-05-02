@@ -11,8 +11,9 @@ import { motion, AnimatePresence } from 'framer-motion';
 import logo from '../images/golo1.png';
 import { getOrCreateDeviceId, getDeviceInfo, getRolePath, startHeartbeat } from '../utils/device';
 import DeviceModal from '../components/DeviceModal';
+import { storeTenant, safeRedirect, clearAuthData } from '../utils/auth';
 
-const GOOGLE_CLIENT_ID = process.env.REACT_APP_GOOGLE_CLIENT_ID;
+const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID;
 
 // ─── Load Google GSI script ───────────────────────────────
 const loadGoogleScript = () =>
@@ -26,25 +27,6 @@ const loadGoogleScript = () =>
     s.onload = resolve;
     document.head.appendChild(s);
   });
-
-const decodeSafeJWT = (token) => {
-  try {
-    const parts = token.split('.');
-    if (parts.length < 2) return null;
-    const b = parts[1].replace(/-/g, '+').replace(/_/g, '/');
-    return JSON.parse(atob(b.padEnd(b.length + ((4 - b.length % 4) % 4), '=')));
-  } catch { return null; }
-};
-
-const storeTenant = (token) => {
-  const p = decodeSafeJWT(token);
-  if (!p) return;
-  const id = p.tenant_id || p.tenantId;
-  if (id) {
-    ['tenentid', 'tenantid', 'tenant_id', 'tenantId', 'x-tenant-id']
-      .forEach(k => localStorage.setItem(k, id));
-  }
-};
 
 // ─── Google Icon ──────────────────────────────────────────
 const GoogleIcon = () => (
@@ -78,6 +60,9 @@ export function Login() {
     pendingTokenRef.current = token;
     storeTenant(token);
 
+    const syncToken = sessionStorage.getItem('billzzy_sync_token');
+    if (syncToken) sessionStorage.removeItem('billzzy_sync_token');
+
     const deviceId = getOrCreateDeviceId();
     const tenantId = localStorage.getItem('tenant_id') || '';
 
@@ -90,9 +75,8 @@ export function Login() {
         }
       });
 
-      const { registered, isExistingUser, inheritedRole, role } = res.data;
+      const { registered, isExistingUser, inheritedRole, role, securityEnabled } = res.data;
 
-      // Case 3 — known device OR security disabled in settings, safe to login now and redirect
       if (registered) {
         login(token);
         startHeartbeat(api);
@@ -101,40 +85,50 @@ export function Login() {
         return;
       }
 
-      // Case 1 or 2 — show modal, still hold off on login()
       const info = getDeviceInfo();
-      setDeviceModal({ isExistingUser: !!isExistingUser, inheritedRole, deviceInfo: info });
+      setDeviceModal({
+        isExistingUser: !!isExistingUser,
+        inheritedRole: inheritedRole || null,
+        deviceInfo: info,
+        securityEnabled: securityEnabled !== false, 
+      });
 
-    } catch {
-      // Fallback — device check failed, log in normally
-      login(token);
-      toast.success('Logged in!');
-      navigate('/admin');
+    } catch (err) {
+      pendingTokenRef.current = null;
+      if (err.code === 'ECONNABORTED' || !err.response) {
+        toast.error('Could not verify your device. Please check your connection and try again.');
+      } else {
+        toast.error('Login failed during device verification. Please try again.');
+      }
     }
   }, [login, navigate]);
 
   // ─── Device modal submit ──────────────────────────────────
   const handleDeviceRegister = useCallback(async (data) => {
-    const { session_name, role, access_code, isExistingUser } = data;
+    const { session_name, role, access_code, isExistingUser, person_name } = data;
     const token = pendingTokenRef.current;
-    if (!token) return;
+    if (!token) {
+      toast.error('Session expired. Please log in again.');
+      return;
+    }
 
     const info = getDeviceInfo();
     const deviceId = getOrCreateDeviceId();
     const tenantId = localStorage.getItem('tenant_id') || '';
 
-    // Fallback role resolution just in case it wasn't passed
-    const finalRole = isExistingUser && deviceModal?.inheritedRole
+    // ✅ FIX: Correctly resolve role for both new and existing users
+    const finalRole = (isExistingUser && deviceModal?.inheritedRole)
       ? deviceModal.inheritedRole
-      : role;
+      : (role || 'customer_care');
 
     try {
-      // Endpoint handles the access code verification securely based on tenant settings
       await publicApi.post('/api/devices/register', {
         session_name,
         role: finalRole,
         access_code,
         isExistingUser,
+        // ✅ FIX: Always send person_name
+        person_name: person_name || info.session_name || '',
         ...info,
       }, {
         headers: {
@@ -147,16 +141,15 @@ export function Login() {
       setDeviceModal(null);
       pendingTokenRef.current = null;
 
-      // NOW call login() — isAuthenticated becomes true but we
-      // navigate immediately so the redirect doesn't fire instead
       login(token);
       startHeartbeat(api);
       toast.success('Device registered successfully!');
       navigate(getRolePath(finalRole));
 
     } catch (err) {
-      toast.error(err.response?.data?.message || 'Registration failed. Check your access code.');
-      // Intentionally DO NOT clear token here so they can try again.
+      const msg = err.response?.data?.message || 'Registration failed. Please try again.';
+      toast.error(msg);
+      // Do NOT clear token — let user retry
     }
   }, [deviceModal, login, navigate]);
 
@@ -178,7 +171,7 @@ export function Login() {
 
       if (res.data.redirectUrl) {
         sessionStorage.removeItem('billzzy_sync_token');
-        window.location.href = res.data.redirectUrl;
+        safeRedirect(res.data.redirectUrl);
         return;
       }
 
@@ -214,10 +207,9 @@ export function Login() {
   if (loading) return null;
 
   if (isAuthenticated) {
-    const searchParams = new URLSearchParams(location.search);
+    const sp = new URLSearchParams(location.search);
     const shouldReturnToStoreIntegration =
-      searchParams.has('shopify') ||
-      searchParams.get('section') === 'store';
+      sp.has('shopify') || sp.get('section') === 'store';
     const redirectTarget = shouldReturnToStoreIntegration
       ? `/admin/settings${location.search || '?section=store'}`
       : '/admin';
@@ -328,9 +320,10 @@ export function Login() {
         {deviceModal && (
           <DeviceModal
             isExistingUser={deviceModal.isExistingUser}
-            defaultName={deviceModal.deviceInfo.session_name}
+            defaultName={deviceModal.deviceInfo?.session_name || ''}
             inheritedRole={deviceModal.inheritedRole}
             onSubmit={handleDeviceRegister}
+            securityEnabled={deviceModal.securityEnabled}
             onClose={() => {
               setDeviceModal(null);
               pendingTokenRef.current = null;
@@ -355,14 +348,14 @@ function EmailForm({ onPostLogin, onForgot }) {
       const syncToken = sessionStorage.getItem('billzzy_sync_token');
       if (syncToken) {
         data.integrationToken = syncToken;
+        sessionStorage.removeItem('billzzy_sync_token');
       }
       const res = await publicApi.post('/api/auth/login', data);
       const token = res.data.access_token || res.data.token;
       if (!token) throw new Error('No token received');
       if (res.data.redirectUrl) {
-        sessionStorage.removeItem('billzzy_sync_token'); // Clean up
-        window.location.href = res.data.redirectUrl; // Redirect to Billzzy
-        return; // Stop execution
+        safeRedirect(res.data.redirectUrl);
+        return;
       }
       await onPostLogin(token);
     } catch (err) {

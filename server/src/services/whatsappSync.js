@@ -2,6 +2,10 @@ const axios = require('axios');
 require('dotenv').config();
 const Catalog = require('../models/settings.js');
 const Tenant = require('../models/Tenant.js');
+const {
+  buildCatalogProductName,
+  buildVariantDescriptionLines
+} = require('../utils/inventoryVariants');
 
 // WhatsApp API Configuration
 const BASE_URL = 'https://graph.facebook.com/v22.0';
@@ -127,9 +131,17 @@ const formatProductForWhatsApp = (item) => {
     throw new Error(`Price is required for WhatsApp product sync: ${item.name}`);
   }
 
+  const variantDescriptionLines = buildVariantDescriptionLines(item);
+  const baseDescription = String(item.description || item.name || '').trim();
+  const enrichedDescription = [baseDescription, ...variantDescriptionLines]
+    .filter(Boolean)
+    .join(' | ');
+
   const product = {
-    name: item.name,
-    description: item.description || item.name,
+ // name: item.name,
+ // description: item.description || item.name,
+    name: buildCatalogProductName(item),
+    description: enrichedDescription || buildCatalogProductName(item),
     price: convertToWhatsAppPrice(item.price, currency),
     currency: currency,
     retailer_id: item.retailer_id,
@@ -219,9 +231,9 @@ const syncSingleProduct = async (item) => {
       return response.data;
     } catch (firstError) {
       // Check for Duplicate retailer_id
-      if (firstError.response?.status === 400 && 
+      if (firstError.response?.status === 400 &&
           firstError.response?.headers?.['www-authenticate']?.includes('Duplicate retailer_id')) {
-        
+
         const getProductsResponse = await axios({
           method: 'GET',
           url: `${BASE_URL}/${catalogId}/products`,
@@ -271,7 +283,7 @@ const syncBatchProducts = async (items) => {
       try {
         const product = formatProductForWhatsApp(item);
         return {
-	item,
+        item,
           request: {
             method: 'POST',
             relative_url: `${catalogId}/products`,
@@ -296,7 +308,7 @@ const syncBatchProducts = async (items) => {
 
     if (response.data && Array.isArray(response.data)) {
       const ops = response.data.map((res, index) => {
-	 const batchEntry = validatedBatch[index];
+         const batchEntry = validatedBatch[index];
         const item = batchEntry?.item;
         if (!item) return null;
 
@@ -377,7 +389,7 @@ const syncAllUnsyncedProducts = async (tenantId) => {
   try {
     // FIX: Using $ne: true finds both 'false' AND missing 'synced' fields
     const query = { synced: { $ne: true } };
-    
+
     if (tenantId) {
       query.tenant_id = tenantId;
     }

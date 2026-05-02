@@ -4,6 +4,13 @@ const crypto = require('crypto');
 const Tenant = require('../models/Tenant');
 const tenantCache = new Map();
 const TENANT_CACHE_TTL = 15 * 60 * 1000;
+const FlowToken = require('../models/FlowToken');
+const {
+  buildOrderFlowPrefill,
+  createOrderFlowPayloadData,
+  loadLatestOrderFlowPrefill,
+  mergeOrderFlowPrefill
+} = require('../utils/orderFlowPrefill');
 const router = express.Router();
 const tenantRateLimits = new Map();
 
@@ -266,8 +273,7 @@ async function getNextScreen(decryptedBody, tenant) {
     console.log("PROCESSING INIT REQUEST - flow_token:", flow_token);
 
     try {
-        const FlowToken = require('../models/FlowToken');
-        const tokenRecord = await FlowToken.findOne({ 
+        const tokenRecord = await FlowToken.findOne({
             token: flow_token,
             status: 'active'
         });
@@ -292,53 +298,81 @@ async function getNextScreen(decryptedBody, tenant) {
                 }
             };
         }
+        const storedContext =
+          tokenRecord?.contextData && typeof tokenRecord.contextData === 'object'
+            ? tokenRecord.contextData
+            : {};
+        const directPrefill = buildOrderFlowPrefill(storedContext, {
+          fallbackPhone: tokenRecord?.phoneNumber,
+          fallbackName: storedContext.customerName
+        });
+        const savedPrefill = tokenRecord?.phoneNumber
+          ? await loadLatestOrderFlowPrefill({
+              tenantId: tokenRecord.tenantId || tenant._id.toString(),
+              phoneNumber: tokenRecord.phoneNumber
+            })
+          : {};
+        const resolvedPrefill = mergeOrderFlowPrefill(directPrefill, savedPrefill);
+
+        return {
+            screen: "DETAILS",
+            data: createOrderFlowPayloadData(
+              {
+                order_total: storedContext.total || storedContext.order_total || '',
+                currency: storedContext.currency || 'INR',
+                item_count: storedContext.item_count || storedContext.items?.length || 0
+              },
+              resolvedPrefill
+            )
+        };
+
     } catch(e) {
         console.log("Could not look up flow token:", e.message);
     }
 
-    // ✅ Default order flow - untouched
-    const stateData = [
-        {"id": "AP", "title": "Andhra Pradesh"},
-        {"id": "AR", "title": "Arunachal Pradesh"},
-        {"id": "AS", "title": "Assam"},
-        {"id": "BR", "title": "Bihar"},
-        {"id": "CT", "title": "Chhattisgarh"},
-        {"id": "GA", "title": "Goa"},
-        {"id": "GJ", "title": "Gujarat"},
-        {"id": "HR", "title": "Haryana"},
-        {"id": "HP", "title": "Himachal Pradesh"},
-        {"id": "JH", "title": "Jharkhand"},
-        {"id": "KA", "title": "Karnataka"},
-        {"id": "KL", "title": "Kerala"},
-        {"id": "MP", "title": "Madhya Pradesh"},
-        {"id": "MH", "title": "Maharashtra"},
-        {"id": "MN", "title": "Manipur"},
-        {"id": "ML", "title": "Meghalaya"},
-        {"id": "MZ", "title": "Mizoram"},
-        {"id": "NL", "title": "Nagaland"},
-        {"id": "OR", "title": "Odisha"},
-        {"id": "PB", "title": "Punjab"},
-        {"id": "RJ", "title": "Rajasthan"},
-        {"id": "SK", "title": "Sikkim"},
-        {"id": "TN", "title": "Tamil Nadu"},
-        {"id": "TG", "title": "Telangana"},
-        {"id": "TR", "title": "Tripura"},
-        {"id": "UP", "title": "Uttar Pradesh"},
-        {"id": "UT", "title": "Uttarakhand"},
-        {"id": "WB", "title": "West Bengal"},
-        {"id": "AN", "title": "Andaman and Nicobar Islands"},
-        {"id": "CH", "title": "Chandigarh"},
-        {"id": "DN", "title": "Dadra and Nagar Haveli and Daman and Diu"},
-        {"id": "DL", "title": "Delhi"},
-        {"id": "JK", "title": "Jammu and Kashmir"},
-        {"id": "LA", "title": "Ladakh"},
-        {"id": "LD", "title": "Lakshadweep"},
-        {"id": "PY", "title": "Puducherry"}
-    ];
+   // ✅ Default order flow - untouched
+// const stateData = [
+//     {"id": "AP", "title": "Andhra Pradesh"},
+//     {"id": "AR", "title": "Arunachal Pradesh"},
+//     {"id": "AS", "title": "Assam"},
+//     {"id": "BR", "title": "Bihar"},
+//     {"id": "CT", "title": "Chhattisgarh"},
+//     {"id": "GA", "title": "Goa"},
+//     {"id": "GJ", "title": "Gujarat"},
+//     {"id": "HR", "title": "Haryana"},
+//     {"id": "HP", "title": "Himachal Pradesh"},
+//     {"id": "JH", "title": "Jharkhand"},
+//     {"id": "KA", "title": "Karnataka"},
+//     {"id": "KL", "title": "Kerala"},
+//     {"id": "MP", "title": "Madhya Pradesh"},
+//     {"id": "MH", "title": "Maharashtra"},
+//     {"id": "MN", "title": "Manipur"},
+//     {"id": "ML", "title": "Meghalaya"},
+//     {"id": "MZ", "title": "Mizoram"},
+//     {"id": "NL", "title": "Nagaland"},
+//     {"id": "OR", "title": "Odisha"},
+//     {"id": "PB", "title": "Punjab"},
+//     {"id": "RJ", "title": "Rajasthan"},
+//     {"id": "SK", "title": "Sikkim"},
+//     {"id": "TN", "title": "Tamil Nadu"},
+//     {"id": "TG", "title": "Telangana"},
+//     {"id": "TR", "title": "Tripura"},
+//     {"id": "UP", "title": "Uttar Pradesh"},
+//     {"id": "UT", "title": "Uttarakhand"},
+//     {"id": "WB", "title": "West Bengal"},
+//     {"id": "AN", "title": "Andaman and Nicobar Islands"},
+//     {"id": "CH", "title": "Chandigarh"},
+//     {"id": "DN", "title": "Dadra and Nagar Haveli and Daman and Diu"},
+//     {"id": "DL", "title": "Delhi"},
+//     {"id": "JK", "title": "Jammu and Kashmir"},
+//     {"id": "LA", "title": "Ladakh"},
+//     {"id": "LD", "title": "Lakshadweep"},
+//     {"id": "PY", "title": "Puducherry"}
+// ];
 
     return {
         screen: "DETAILS",
-        data: { state: stateData }
+        data: createOrderFlowPayloadData({}, {})
     };
 }
 
@@ -722,4 +756,3 @@ setInterval(() => {
 }, 60000);
 
 module.exports = router;
-

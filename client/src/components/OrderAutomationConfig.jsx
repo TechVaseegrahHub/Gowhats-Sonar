@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+ import React, { useState, useEffect } from 'react';
 import axios from 'axios';
 import {
   Save, Loader2, MessageSquare, Clock, Truck,
@@ -219,6 +219,14 @@ const OrderAutomationConfig = () => {
           successUrl:    '',
           cancelUrl:     '',
         },
+        
+        hitpayConfig: {
+	  apiKey:      '',
+	  webhookSalt: '',
+	  environment: 'production',
+	  currency:    'SGD',
+	  successUrl:  '',
+	},
 
         // ── Cashfree (stored per-tenant in DB, encrypted) ─
         cashfreeConfig: {
@@ -277,6 +285,10 @@ const OrderAutomationConfig = () => {
               cashfreeConfig: {
                 ...prev.automationConfig.paymentRequest.cashfreeConfig,
                 ...db.automationConfig?.paymentRequest?.cashfreeConfig
+              },
+              hitpayConfig: {
+                ...prev.automationConfig.paymentRequest.hitpayConfig,
+                ...db.automationConfig?.paymentRequest?.hitpayConfig
               },
               template: {
                 ...prev.automationConfig.paymentRequest.template,
@@ -507,7 +519,11 @@ const OrderAutomationConfig = () => {
                       icon={Shield} name="Cashfree"
                       tagline="UPI payment via Cashfree — creates order, sends UPI intent via WhatsApp Pay"
                       badge="INR · UPI" badgeColor="bg-amber-50 text-amber-600" />
-                  </div>
+                    <GatewayCard id="hitpay" selected={gw} onChange={v => { updateConfig('paymentRequest','paymentGateway',v); setTestResult(null); }}
+                     icon={Wifi} name="HitPay"
+                     tagline="CTA button opens HitPay hosted checkout — cards, PayNow, GrabPay, FPX, DuitNow & more"
+                     badge="SGD · GLOBAL" badgeColor="bg-teal-50 text-teal-600" /> 
+                 </div>
                 </div>
 
                 {/* Step 2 — credentials */}
@@ -726,6 +742,119 @@ const OrderAutomationConfig = () => {
                     </div>
                   </div>
                 )}
+
+	{/* ── HITPAY ── */}
+	{gw === 'hitpay' && (
+	  <div className="bg-white rounded-2xl border border-slate-200 p-5 space-y-5">
+	    <div className="flex items-center justify-between">
+	      <div className="flex items-center gap-2.5">
+	        <div className="w-7 h-7 rounded-lg bg-teal-100 flex items-center justify-center">
+	          <CreditCard className="w-3.5 h-3.5 text-teal-600" />
+	        </div>
+	        <h4 className="text-sm font-semibold text-slate-800">Step 2 — HitPay API Credentials</h4>
+	      </div>
+	      <a href="https://dashboard.hit-pay.com/settings" target="_blank" rel="noopener noreferrer"
+	        className="inline-flex items-center gap-1 text-xs text-teal-600 hover:text-teal-700 font-semibold">
+	        HitPay Dashboard <ExternalLink className="w-3 h-3" />
+	      </a>
+	    </div>
+
+	    <InfoBanner color="green" icon={Lock}>
+	      Your HitPay API key is <strong>saved encrypted per account</strong> — used server-side only
+	      to create payment requests. Never visible to customers.
+	    </InfoBanner>
+
+	    {/* Environment */}
+	    <Field label="Environment">
+	      <div className="grid grid-cols-2 gap-3">
+	        {[
+	          { val: 'sandbox',    label: 'Sandbox',    hint: 'For testing',      badge: 'TEST', bc: 'bg-amber-100 text-amber-700'    },
+	          { val: 'production', label: 'Production', hint: 'For live payments', badge: 'LIVE', bc: 'bg-emerald-100 text-emerald-700' }
+	        ].map(env => (
+	          <label key={env.val} className={`flex items-center gap-3 px-4 py-3 rounded-xl border-2 cursor-pointer transition-all
+	            ${ac.paymentRequest.hitpayConfig.environment === env.val
+	              ? 'border-emerald-500 bg-emerald-50/60'
+	              : 'border-slate-200 hover:border-slate-300'}`}>
+	            <input type="radio" name="hpEnv" value={env.val}
+	              checked={ac.paymentRequest.hitpayConfig.environment === env.val}
+	              onChange={() => updateNested('paymentRequest','hitpayConfig','environment',env.val)}
+	              className="accent-emerald-600" />
+	            <div>
+	              <div className="flex items-center gap-1.5">
+	                <p className="font-semibold text-slate-800 text-xs">{env.label}</p>
+	                <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-md ${env.bc}`}>{env.badge}</span>
+	              </div>
+	              <p className="text-[11px] text-slate-400 mt-0.5">{env.hint}</p>
+	            </div>
+	          </label>
+	        ))}
+	      </div>
+	    </Field>
+
+	    <SecretField label="API Key"
+	      value={ac.paymentRequest.hitpayConfig.apiKey}
+	      onChange={v => updateNested('paymentRequest','hitpayConfig','apiKey',v)}
+	      placeholder="Your HitPay API key"
+	      hint="HitPay Dashboard → Settings → Payment Gateway → API Keys" />
+
+	    <SecretField label="Webhook Salt"
+	      value={ac.paymentRequest.hitpayConfig.webhookSalt}
+	      onChange={v => updateNested('paymentRequest','hitpayConfig','webhookSalt',v)}
+	      placeholder="Your HitPay webhook salt"
+	      hint="HitPay Dashboard → Settings → Payment Gateway → Webhook Salt" />
+
+	    <WebhookUrlBox path="/webhook/hitpay" />
+
+	    <Field label="Currency">
+	      <select className="w-full px-3.5 py-2.5 text-sm bg-white border border-slate-200 rounded-xl text-slate-800
+	        focus:outline-none focus:ring-2 focus:ring-emerald-500/30 focus:border-emerald-400 transition-all"
+	        value={ac.paymentRequest.hitpayConfig.currency}
+	        onChange={e => updateNested('paymentRequest','hitpayConfig','currency',e.target.value)}>
+	        <option value="SGD">SGD — Singapore Dollar (S$)</option>
+	        <option value="MYR">MYR — Malaysian Ringgit (RM)</option>
+	        <option value="HKD">HKD — Hong Kong Dollar (HK$)</option>
+	        <option value="USD">USD — US Dollar ($)</option>
+	        <option value="AUD">AUD — Australian Dollar (A$)</option>
+	      </select>
+	    </Field>
+
+	    <Field label="Success Redirect URL" hint="Where to redirect after payment (optional)">
+	      <Input value={ac.paymentRequest.hitpayConfig.successUrl || ''}
+	        onChange={e => updateNested('paymentRequest','hitpayConfig','successUrl',e.target.value)}
+	        placeholder="https://yoursite.com/thank-you" />
+	    </Field>
+
+	    {/* How it works */}
+	    <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 space-y-2.5">
+	      <p className="text-xs font-semibold text-slate-600 mb-1">How HitPay works</p>
+	      {[
+	        'Customer places order on WhatsApp',
+	        'Server creates HitPay payment request via API',
+	        'CTA button sent to customer with checkout URL',
+	        'Customer pays via PayNow, GrabPay, card, FPX etc.',
+	        'HitPay webhook confirms payment to your server',
+	        'Order confirmed + WhatsApp notification sent',
+	      ].map((step, i) => (
+	        <div key={i} className="flex items-center gap-2.5">
+	          <span className="w-5 h-5 rounded-full bg-teal-100 text-teal-700 text-[10px] font-bold flex items-center justify-center flex-shrink-0">{i+1}</span>
+	          <span className="text-xs text-slate-600">{step}</span>
+	        </div>
+	      ))}
+	    </div>
+
+	    <div className="flex items-center gap-3 pt-1 border-t border-slate-100">
+	      <button onClick={handleTestConnection}
+	        disabled={testing || !ac.paymentRequest.hitpayConfig.apiKey}
+	        className="flex items-center gap-2 px-4 py-2 bg-teal-600 hover:bg-teal-700
+	          disabled:opacity-50 text-white text-xs font-semibold rounded-xl transition-colors">
+	        {testing ? <Loader2 className="animate-spin w-3.5 h-3.5" /> : <Wifi className="w-3.5 h-3.5" />}
+	        {testing ? 'Testing…' : 'Test Connection'}
+	      </button>
+	      {testResult === 'ok'    && <span className="flex items-center gap-1.5 text-xs font-semibold text-emerald-600"><CheckCircle className="w-3.5 h-3.5" />Connected successfully</span>}
+	      {testResult === 'error' && <span className="flex items-center gap-1.5 text-xs font-semibold text-red-500"><AlertCircle className="w-3.5 h-3.5" />Invalid credentials — check and retry</span>}
+	    </div>
+	  </div>
+	)}
 
                 {/* Step 3 — shared message template */}
                 <div className="bg-white rounded-2xl border border-slate-200 p-5 space-y-4">

@@ -2,10 +2,10 @@ const cron = require('node-cron');
 const mongoose = require('mongoose');
 const path = require('path');
 const fs = require('fs');
-const Broadcast = mongoose.model('Broadcast');
-const Tenant = mongoose.model('Tenant');
-const Message = mongoose.model('Message');
-const Contact = mongoose.model('Contact');
+const Broadcast = require('../models/Broadcast');
+const Message   = require('../models/Message');
+const Contact   = require('../models/Contact');
+const Tenant    = require('../models/Tenant');
 const WhatsAppService = require('./whatsappServices');
 const rateLimiter = require('./broadcastRateLimiter');
 

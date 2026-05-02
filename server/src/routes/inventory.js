@@ -11,8 +11,16 @@ const {
   DEFAULT_ALERT_CONFIG,
   normalizeInventoryAlertConfig
 } = require('../services/orderInventoryService');
+const { uploadImageBufferToCloudinary } = require('../utils/cloudinary');
 
 const MAX_ADDITIONAL_IMAGES = 10;
+const MAX_IMAGE_UPLOAD_SIZE_BYTES = 8 * 1024 * 1024;
+const ALLOWED_IMAGE_MIME_TYPES = new Set([
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'image/gif'
+]);
 
 const normalizeAdditionalImages = (input) => {
   if (!input) return [];
@@ -48,8 +56,35 @@ const normalizeAdditionalImages = (input) => {
     .slice(0, MAX_ADDITIONAL_IMAGES);
 };
 
-// Configure multer for CSV files only
-const upload = multer({
+const sanitizePrice = (raw) => {
+  const n = parseFloat(raw);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Math.round(n * 100) / 100;
+};
+
+const sanitizeInventory = (raw) => {
+  if (raw === undefined || raw === null || raw === '') return null;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+};
+
+const buildInventoryVariantPatch = (body) => {
+  const patch = {};
+  if (body.color !== undefined)         patch.color         = String(body.color || '').trim();
+  if (body.size !== undefined)          patch.size          = String(body.size || '').trim();
+  if (body.variant_group !== undefined) patch.variant_group = String(body.variant_group || '').trim();
+  if (body.variant_label !== undefined) patch.variant_label = String(body.variant_label || '').trim();
+  return patch;
+};
+
+const isCloudinaryImageUploadEnabled = async (tenantId) => {
+  const settings = await Settings.findOne({ tenant_id: tenantId })
+    .select('aiConfig.cloudinaryImageUploadEnabled')
+    .lean();
+  return settings?.aiConfig?.cloudinaryImageUploadEnabled !== false;
+};
+
+const csvUpload = multer({
   fileFilter: (req, file, cb) => {
     if (file.mimetype === 'text/csv' || file.originalname.endsWith('.csv')) {
       cb(null, true);
@@ -59,19 +94,33 @@ const upload = multer({
   }
 });
 
+const imageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: MAX_IMAGE_UPLOAD_SIZE_BYTES
+  },
+  fileFilter: (req, file, cb) => {
+    if (ALLOWED_IMAGE_MIME_TYPES.has(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Invalid image type. Please upload JPG, PNG, WebP, or GIF files.'));
+    }
+  }
+});
+
 // POST route to upload CSV file
-router.post('/upload/csv', upload.single('file'), async (req, res) => {
+router.post('/upload/csv', csvUpload.single('file'), async (req, res) => {
   if (!req.file) {
-    return res.status(400).json({ 
+    return res.status(400).json({
       success: false,
-      message: "No CSV file uploaded" 
+      message: "No CSV file uploaded"
     });
   }
 
   try {
     const results = [];
     let rowIndex = 0;
-    
+
     const bufferStream = new Readable();
     bufferStream.push(req.file.buffer);
     bufferStream.push(null);
@@ -87,14 +136,13 @@ router.post('/upload/csv', upload.single('file'), async (req, res) => {
         encoding: 'utf8'
       })
       .validate((data, cb) => {
-        // Log the raw data for debugging
         console.log('Validating row:', data);
-        
+
         const requiredFields = [
-          'retailer_id', 'name', 'description', 'condition', 
-          'url', 'price', 'availability', 'image_url',
+          'retailer_id', 'name', 'description', 'condition',
+          'price', 'availability', 'image_url',
         ];
-        
+
         const missingFields = requiredFields.filter(field => {
           return !data[field] || data[field].toString().trim() === '';
         });
@@ -103,7 +151,6 @@ router.post('/upload/csv', upload.single('file'), async (req, res) => {
           return cb(null, false, `Missing required fields: ${missingFields.join(', ')}`);
         }
 
-        // Validate price is a number
         const price = parseFloat(data.price);
         if (isNaN(price)) {
           return cb(null, false, 'Price must be a valid number');
@@ -114,17 +161,16 @@ router.post('/upload/csv', upload.single('file'), async (req, res) => {
       .on('data', (row) => {
         rowIndex++;
         try {
-          // Clean the data
           const cleanedData = {
             retailer_id: row.retailer_id.toString().trim(),
             name: row.name.toString().trim(),
             description: row.description.toString().trim(),
             condition: row.condition.toString().trim(),
-            url: row.url.toString().trim(),
-            price: parseFloat(row.price),
+            url: row.url?.toString().trim() || '',
+            price: sanitizePrice(row.price),
             availability: row.availability.toString().trim().toLowerCase(),
             image_url: row.image_url.toString().trim(),
-	    additional_images: normalizeAdditionalImages(row.additional_images),
+            additional_images: normalizeAdditionalImages(row.additional_images),
             currency: row.currency?.toString().trim() || 'INR',
             synced: false
           };
@@ -133,7 +179,7 @@ router.post('/upload/csv', upload.single('file'), async (req, res) => {
             ...cleanedData,
             tenant_id: req.tenantId
           });
-          
+
           console.log(`Successfully processed row ${rowIndex}:`, cleanedData);
         } catch (error) {
           console.error(`Error processing row ${rowIndex}:`, error);
@@ -156,13 +202,10 @@ router.post('/upload/csv', upload.single('file'), async (req, res) => {
 
     const processedResults = await processStream;
     console.log(`Attempting to insert ${processedResults.length} items`);
-    
-    // Insert products into MongoDB
+
     const savedProducts = await InventoryItem.insertMany(processedResults);
 
-    // Attempt to sync with WhatsApp in batches
     try {
-      // Process in batches of 50 (WhatsApp's limit)
       const batchSize = 50;
       for (let i = 0; i < savedProducts.length; i += batchSize) {
         const batch = savedProducts.slice(i, i + batchSize);
@@ -171,37 +214,91 @@ router.post('/upload/csv', upload.single('file'), async (req, res) => {
       console.log(`Successfully synced ${savedProducts.length} products with WhatsApp`);
     } catch (syncError) {
       console.error('Failed to sync bulk products with WhatsApp:', syncError);
-      // Products are saved, but sync failed - will be picked up by scheduled task
     }
 
-    res.status(200).json({ 
+    res.status(200).json({
       success: true,
       message: `Successfully imported ${processedResults.length} items from CSV file and initiated WhatsApp sync`
     });
   } catch (error) {
     console.error('CSV Processing Error:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       success: false,
       message: error.message || "Error processing CSV file"
     });
   }
 });
 
+router.post('/upload/image', (req, res) => {
+  imageUpload.single('file')(req, res, async (uploadError) => {
+    if (uploadError) {
+      return res.status(400).json({
+        success: false,
+        message: uploadError.message || 'Image upload failed'
+      });
+    }
 
+    try {
+      if (!req.file) {
+        return res.status(400).json({
+          success: false,
+          message: 'No image file uploaded'
+        });
+      }
+
+      const uploadEnabled = await isCloudinaryImageUploadEnabled(req.tenantId);
+      if (!uploadEnabled) {
+        return res.status(403).json({
+          success: false,
+          message: 'Cloudinary image upload is disabled for this tenant'
+        });
+      }
+
+      const uploadResult = await uploadImageBufferToCloudinary(req.file.buffer, {
+        mimeType: req.file.mimetype,
+        folder: `gowhats/inventory/${req.tenantId}`
+      });
+
+      return res.status(200).json({
+        success: true,
+        message: 'Image uploaded successfully',
+        url: uploadResult.secure_url,
+        publicId: uploadResult.public_id,
+        metadata: {
+          width: uploadResult.width,
+          height: uploadResult.height,
+          format: uploadResult.format,
+          bytes: uploadResult.bytes
+        }
+      });
+    } catch (error) {
+      const cloudinaryMessage =
+        error.response?.data?.error?.message ||
+        error.response?.data?.message ||
+        error.message;
+
+      console.error('Inventory image upload error:', cloudinaryMessage);
+
+      return res.status(500).json({
+        success: false,
+        message: cloudinaryMessage || 'Failed to upload image'
+      });
+    }
+  });
+});
 
 // POST route to add a new inventory item
 router.post('/', async (req, res) => {
   try {
-    // Check if a product with the same retailer_id already exists
     const existingItem = await InventoryItem.findOne({
       tenant_id: req.tenantId,
       retailer_id: req.body.retailer_id
     });
 
     if (existingItem) {
-      return res.status(409).json({ 
-        message: "An item with this retailer_id already exists", 
-        existingItem 
+      return res.status(409).json({
+        message: "An item with this retailer_id already exists",
+        existingItem
       });
     }
 
@@ -212,33 +309,31 @@ router.post('/', async (req, res) => {
       description: req.body.description,
       condition: req.body.condition,
       url: req.body.url,
-      price: req.body.price,
+      price: sanitizePrice(req.body.price),
       image_url: req.body.image_url,
       additional_images: normalizeAdditionalImages(req.body.additional_images),
       availability: req.body.availability,
-      inventory: req.body.inventory,
+      inventory: sanitizeInventory(req.body.inventory),
       currency: req.body.currency || 'INR',
       synced: false
     });
 
     const savedItem = await newItem.save();
-    
-    // Attempt to sync with WhatsApp immediately
+
     try {
       await whatsappSync.syncSingleProduct(savedItem);
       console.log(`Successfully synced product: ${savedItem.name} (${savedItem._id})`);
-      res.status(201).json({ 
-        message: "Item added and synced with WhatsApp successfully", 
-        item: savedItem, 
-        whatsappSynced: true 
+      res.status(201).json({
+        message: "Item added and synced with WhatsApp successfully",
+        item: savedItem,
+        whatsappSynced: true
       });
     } catch (syncError) {
       console.error('Failed to sync new product with WhatsApp:', syncError);
-      // Product is saved, but sync failed - will be picked up by scheduled task
-      res.status(201).json({ 
-        message: "Item added successfully, but WhatsApp sync failed (will retry automatically)", 
-        item: savedItem, 
-        whatsappSynced: false 
+      res.status(201).json({
+        message: "Item added successfully, but WhatsApp sync failed (will retry automatically)",
+        item: savedItem,
+        whatsappSynced: false
       });
     }
   } catch (error) {
@@ -257,7 +352,7 @@ router.get('/', async (req, res) => {
   }
 });
 
-// GET low-stock alert configuration for View Catalog page
+// GET low-stock alert configuration
 router.get('/alerts-config', async (req, res) => {
   try {
     const tenantId = req.tenantId;
@@ -269,10 +364,7 @@ router.get('/alerts-config', async (req, res) => {
       settings?.automationConfig?.inventoryAlerts || DEFAULT_ALERT_CONFIG
     );
 
-    return res.status(200).json({
-      success: true,
-      config
-    });
+    return res.status(200).json({ success: true, config });
   } catch (error) {
     console.error('Error fetching inventory alert config:', error);
     return res.status(500).json({
@@ -283,7 +375,7 @@ router.get('/alerts-config', async (req, res) => {
   }
 });
 
-// PUT low-stock alert configuration for View Catalog page
+// PUT low-stock alert configuration
 router.put('/alerts-config', async (req, res) => {
   try {
     const tenantId = req.tenantId;
@@ -314,12 +406,71 @@ router.put('/alerts-config', async (req, res) => {
   }
 });
 
+// Search inventory by product name / SKU for autocomplete
+router.get('/search', async (req, res) => {
+  try {
+    const query = String(req.query.q || '').trim();
+    const limit = Math.min(Math.max(parseInt(req.query.limit || '8', 10), 1), 25);
+
+    if (query.length < 2) {
+      return res.status(200).json({ success: true, items: [], count: 0 });
+    }
+
+    const escapedQuery = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const matchRegex = new RegExp(escapedQuery, 'i');
+    const startsWithRegex = new RegExp(`^${escapedQuery}`, 'i');
+
+    const items = await InventoryItem.find({
+      tenant_id: req.tenantId,
+      $or: [
+        { name: matchRegex },
+        { color: matchRegex },
+        { size: matchRegex },
+        { variant_group: matchRegex },
+        { variant_label: matchRegex },
+        { retailer_id: matchRegex },
+        { retailerId: matchRegex },
+        { sku: matchRegex }
+      ]
+    })
+      .select('_id name color size variant_group variant_label retailer_id retailerId sku price inventory availability image_url')
+      .limit(limit)
+      .lean();
+
+    const getSku = (item) => String(item?.retailer_id || item?.retailerId || item?.sku || '');
+
+    const sortedItems = items.sort((a, b) => {
+      const aNameStarts = startsWithRegex.test(a.name || '') ? 1 : 0;
+      const bNameStarts = startsWithRegex.test(b.name || '') ? 1 : 0;
+      if (aNameStarts !== bNameStarts) return bNameStarts - aNameStarts;
+
+      const aSkuStarts = startsWithRegex.test(getSku(a)) ? 1 : 0;
+      const bSkuStarts = startsWithRegex.test(getSku(b)) ? 1 : 0;
+      if (aSkuStarts !== bSkuStarts) return bSkuStarts - aSkuStarts;
+
+      return String(a.name || '').localeCompare(String(b.name || ''));
+    });
+
+    return res.status(200).json({
+      success: true,
+      items: sortedItems,
+      count: sortedItems.length
+    });
+  } catch (error) {
+    console.error('Error searching inventory:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Error searching inventory',
+      error: error.message
+    });
+  }
+});
+
 // PUT route to update an inventory item
 router.put('/:id', async (req, res) => {
   try {
     const itemId = req.params.id;
-    
-    // Verify the item belongs to the tenant
+
     const existingItem = await InventoryItem.findOne({
       _id: itemId,
       tenant_id: req.tenantId
@@ -329,26 +480,38 @@ router.put('/:id', async (req, res) => {
       return res.status(404).json({ message: "Item not found" });
     }
 
-    // If the product was previously synced, mark it as unsynced to trigger an update
-    let syncStatus = existingItem.synced;
+    if (existingItem.isBillzzySynced) {
+      return res.status(403).json({
+        message: "This product inventory is managed by Billzzy. Please update stock in your Billing App."
+      });
+    }
+
+    const incomingPrice     = sanitizePrice(req.body.price);
+    const incomingInventory = sanitizeInventory(req.body.inventory);
+
     const normalizedAdditionalImages = normalizeAdditionalImages(req.body.additional_images);
+    const normalizedVariantFields    = buildInventoryVariantPatch(req.body);
+
+    let syncStatus = existingItem.synced;
     if (
-      existingItem.name !== req.body.name ||
-      existingItem.description !== req.body.description ||
-      existingItem.price !== req.body.price ||
-      existingItem.image_url !== req.body.image_url ||
+      existingItem.name                 !== req.body.name                              ||
+      existingItem.color                !== (normalizedVariantFields.color        || '') ||
+      existingItem.size                 !== (normalizedVariantFields.size         || '') ||
+      existingItem.variant_group        !== (normalizedVariantFields.variant_group || '') ||
+      existingItem.variant_label        !== (normalizedVariantFields.variant_label || '') ||
+      existingItem.description          !== req.body.description                        ||
+      Number(existingItem.price)        !== incomingPrice                               ||
+      existingItem.image_url            !== req.body.image_url                          ||
       JSON.stringify(existingItem.additional_images || []) !== JSON.stringify(normalizedAdditionalImages) ||
-      existingItem.availability !== req.body.availability ||
-      existingItem.condition !== req.body.condition ||
-      existingItem.url !== req.body.url ||
-      existingItem.inventory !== req.body.inventory
+      existingItem.availability         !== req.body.availability                       ||
+      existingItem.condition            !== req.body.condition                          ||
+      (existingItem.url || '')          !== (req.body.url || '')                        ||
+      Number(existingItem.inventory)    !== incomingInventory
     ) {
-      // Product has changed, need to re-sync
       syncStatus = false;
     }
 
-     const parsedInventory = Number(req.body.inventory);
-    const hasValidInventory = Number.isFinite(parsedInventory) && parsedInventory >= 0;
+    const hasValidInventory = incomingInventory !== null;
 
     const alertResetPatch = {};
     if (hasValidInventory) {
@@ -357,36 +520,36 @@ router.put('/:id', async (req, res) => {
         .lean();
       const threshold = Number(alertSettings?.automationConfig?.inventoryAlerts?.threshold) || DEFAULT_ALERT_CONFIG.threshold;
 
-      if (parsedInventory > threshold) {
-        alertResetPatch.low_stock_alertt_sent = false;
-        alertResetPatch.low_stock_alertt_sent_at = null;
-        alertResetPatch.low_stock_alertt_recipients = [];
-        alertResetPatch.low_stock_alertt_threshold = null;
+      if (incomingInventory > threshold) {
+        alertResetPatch.low_stock_alertt_sent        = false;
+        alertResetPatch.low_stock_alertt_sent_at     = null;
+        alertResetPatch.low_stock_alertt_recipients  = [];
+        alertResetPatch.low_stock_alertt_threshold   = null;
       }
     }
 
     const updatedItem = await InventoryItem.findByIdAndUpdate(
       itemId,
       {
-        retailer_id: req.body.retailer_id,
-        name: req.body.name,
-        description: req.body.description,
-        condition: req.body.condition,
-        url: req.body.url,
-        price: req.body.price,
-        image_url: req.body.image_url,
+        retailer_id:       req.body.retailer_id,
+        name:              req.body.name,
+        ...normalizedVariantFields,
+        description:       req.body.description,
+        condition:         req.body.condition,
+        url:               req.body.url || '',
+        price:             incomingPrice,
+        image_url:         req.body.image_url,
         additional_images: normalizedAdditionalImages,
-        inventory: req.body.inventory,
-        availability: req.body.availability,
-        currency: req.body.currency || existingItem.currency,
-        synced: syncStatus,
-         tenant_id: req.tenantId, // Ensure tenant_id remains unchanged
+        inventory:         incomingInventory,
+        availability:      req.body.availability,
+        currency:          req.body.currency || existingItem.currency,
+        synced:            syncStatus,
+        tenant_id:         req.tenantId,
         ...alertResetPatch
       },
-      { new: true } // Return the updated document
+      { new: true }
     );
 
-    // If product needs to be re-synced, do it immediately
     if (!syncStatus) {
       try {
         await whatsappSync.syncSingleProduct(updatedItem);
@@ -421,7 +584,6 @@ router.delete('/:id', async (req, res) => {
   try {
     const itemId = req.params.id;
 
-    // Verify the item belongs to the tenant
     const existingItem = await InventoryItem.findOne({
       _id: itemId,
       tenant_id: req.tenantId
@@ -431,24 +593,18 @@ router.delete('/:id', async (req, res) => {
       return res.status(404).json({ message: "Item not found" });
     }
 
-    // TODO: If needed, implement WhatsApp product deletion here
-    // Currently, WhatsApp doesn't offer a straightforward way to delete products via API
-    // Delete from WhatsApp if it was synced
     if (existingItem.synced && existingItem.whatsapp_sync_details && existingItem.whatsapp_sync_details.productId) {
       try {
         await whatsappSync.deleteProduct(existingItem);
         console.log(`Successfully deleted product from WhatsApp: ${existingItem.name} (${existingItem._id})`);
       } catch (deleteError) {
         console.error(`Failed to delete product from WhatsApp: ${deleteError.message}`);
-        // Continue with MongoDB deletion even if WhatsApp deletion fails
       }
     }
 
     await InventoryItem.findByIdAndDelete(itemId);
 
-    res.status(200).json({
-      message: "Item deleted successfully"
-    });
+    res.status(200).json({ message: "Item deleted successfully" });
   } catch (error) {
     console.error('Error deleting item:', error);
     res.status(500).json({ message: "Error deleting item", error: error.message });
@@ -462,10 +618,10 @@ router.post('/sync', async (req, res) => {
     res.status(200).json(result);
   } catch (error) {
     console.error('Error syncing inventory:', error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Error syncing inventory with WhatsApp", 
-      error: error.message 
+    res.status(500).json({
+      success: false,
+      message: "Error syncing inventory with WhatsApp",
+      error: error.message
     });
   }
 });
@@ -474,8 +630,7 @@ router.post('/sync', async (req, res) => {
 router.post('/sync/:id', async (req, res) => {
   try {
     const itemId = req.params.id;
-    
-    // Verify the item belongs to the tenant
+
     const existingItem = await InventoryItem.findOne({
       _id: itemId,
       tenant_id: req.tenantId
@@ -485,7 +640,6 @@ router.post('/sync/:id', async (req, res) => {
       return res.status(404).json({ message: "Item not found" });
     }
 
-    // Force sync regardless of current sync statusnpm 
     try {
       const result = await whatsappSync.syncSingleProduct(existingItem);
       res.status(200).json({
@@ -503,34 +657,22 @@ router.post('/sync/:id', async (req, res) => {
     }
   } catch (error) {
     console.error('Error syncing product:', error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Error syncing product", 
-      error: error.message 
+    res.status(500).json({
+      success: false,
+      message: "Error syncing product",
+      error: error.message
     });
   }
 });
 
-// Get sync status statistics
-// GET route to fetch sync status statistics
+// GET sync status statistics
 router.get('/sync/status', async (req, res) => {
   try {
     const tenantId = req.tenantId;
-    
-    // Total number of items for this tenant
+
     const totalCount = await InventoryItem.countDocuments({ tenant_id: tenantId });
-    
-    // Items that are explicitly marked as synced
-    const syncedCount = await InventoryItem.countDocuments({ 
-      tenant_id: tenantId, 
-      synced: true 
-    });
-    
-    // Items that are NOT marked as synced (includes false, null, or undefined)
-    const unsyncedCount = await InventoryItem.countDocuments({ 
-      tenant_id: tenantId, 
-      synced: { $ne: true } 
-    });
+    const syncedCount = await InventoryItem.countDocuments({ tenant_id: tenantId, synced: true });
+    const unsyncedCount = await InventoryItem.countDocuments({ tenant_id: tenantId, synced: { $ne: true } });
 
     res.status(200).json({
       success: true,
@@ -569,16 +711,13 @@ router.get('/by-retailer-ids', async (req, res) => {
       retailer_id: { $in: retailerIds }
     }).lean();
 
-    // Return as a map keyed by retailer_id for easy lookup
     const itemsMap = {};
-    items.forEach(item => {
-      itemsMap[item.retailer_id] = item;
-    });
+    items.forEach(item => { itemsMap[item.retailer_id] = item; });
 
     res.status(200).json({
       success: true,
-      items: itemsMap,          // Map: { retailer_id: item }
-      products: items,          // Also return as array (CatalogMessageComponent uses this)
+      items: itemsMap,
+      products: items,
       count: items.length
     });
   } catch (error) {
@@ -592,4 +731,3 @@ router.get('/by-retailer-ids', async (req, res) => {
 });
 
 module.exports = router;
-

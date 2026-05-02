@@ -29,20 +29,22 @@ const apiKeySchema = new mongoose.Schema({
   },
   permissions: [{
     type: String,
-    enum: [
-      'orders.read',
-      'orders.write',
-      'orders.update',
-      'messages.read',
-      'messages.send',
-      'contacts.read',
-      'contacts.write',
-      'inventory.read',
-      'inventory.write',
-      'templates.read',
-      'broadcasts.send',
-      'webhooks.manage'
-    ]
+enum: [
+  'orders.read',
+  'orders.write',
+  'orders.update',
+  'messages.read',
+  'messages.send',
+  'contacts.read',
+  'contacts.write',
+  'inventory.read',
+  'inventory.write',
+  'templates.read',
+  'broadcasts.send',
+  'webhooks.manage',
+  'billing.read',
+  'transactions.read'
+]
   }],
   isActive: {
     type: Boolean,

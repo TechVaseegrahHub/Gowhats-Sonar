@@ -6,57 +6,37 @@ import VirtualContactList from './VirtualContactList';
 import { toast } from "react-hot-toast";
 import { AiOutlinePlus } from "react-icons/ai";
 import {
-  BanIcon, ChevronDownIcon, EditIcon, SearchIcon, Mic, Send, SmileIcon,
-  Search, X, Trash2, Pencil, Check, Paperclip, Image, Camera, FileText,
-  User, BotIcon, UserIcon, Wallet, Landmark, ListFilter, LayoutPanelTop,
-  Play, MessageSquare, Download, MapPin, Navigation, AlertCircle,
-  Phone, ExternalLink, Tag, Mail, ChevronLeft, MoreVertical, Menu,
-  Edit2, CheckSquare, Square, Plus, Minus, Monitor, UserPlus, Reply, Copy, PhoneOff
+  BanIcon, ChevronDownIcon, EditIcon, SmileIcon,
+  Search, X, Trash2, Paperclip, Image, Camera, FileText,
+  User, ListFilter, LayoutPanelTop, Send,
+  Mic,
+  Check,
+  MessageSquare, Download, MapPin, Navigation, AlertCircle,
+  Phone, ExternalLink, Tag, Mail, ChevronLeft, MoreVertical,
+  Edit2, CheckSquare, Square, Plus, Minus, Reply, Copy, PhoneOff, ShoppingBag
 } from "lucide-react";
-import { ShoppingBag } from 'lucide-react';
 import Picker from "@emoji-mart/react";
-import socketService from '../services/socketService';
 import data from "@emoji-mart/data";
 import { useAuth } from "../context/AuthContext";
+import { useLocation, useNavigate } from 'react-router-dom';
 import QuickResponseChat from '../components/QuickResponseChat';
 import MediaComponents from './MediaMessages';
 import AbandonedCartMessage from './AbandonedCartMessage';
 import OrderMessage from './OrderMessage';
 import DispatchMessage from './DispatchMessage';
-import QuickResponse from "../components/QuickResponse.jsx";
-import CallingPanel from './CallingPanel';
+import CallingPanel from './CallingPanel'
 import {
   FlowSendingMessage,
   FlowCompletionMessage,
   CatalogMessageComponent,
   ShippingOptionsMessage,
-  ShippingSelectionMessage,
   PaymentMessageComponent,
   TicketMessage
 } from './FlowMessageComponents';
 import {
-  Container, Sidebar, SearchBar, ContactList, ContactItem, ChatArea,
-  ChatHeader, Messages, MessageBubble, MessageInput, ChatProfile,
-  ProfileContainer, ProfileHeader, NotificationBubble, Tabs, Tab,
-  OrderSummary, OrderSummaryCard, OrderSummaryTitle, OrderSummaryValue,
-  LastOrder, LastOrderHeader, LastOrderId, SearchButton, LastOrderStatus,
-  StatusTag, OrderDate, LastOrderFooter, OrderTotal, DetailsButton,
-  WooCommerceNotes, NotesTabs, NotesTab, NotesContent, Note, NoteLabel,
-  NoteInfo, NoteValue, EditNote, TemplateContainer, AudioMessageContainer,
-  ExpiryBanner, OrderContainer, ListMessage, ButtonMessage, WelcomeMessage,
-  CatalogMessage,
-  InteractiveMessageContainer,
-  FlowMessage,
-  ShippingMessage,
+  Container, Sidebar, ContactList,  ChatArea,
+  ChatHeader, Messages, MessageBubble, MessageInput, TemplateContainer,  ListMessage, ButtonMessage, WelcomeMessage,
   OrderConfirmationMessage,
-  SearchContainer,
-  SearchClearButton, TeamAssistTab,
-  TeamBadge,
-  ResolveButton,
-  HumanAgentMessage,
-  TabCounter,
-  ContactItemWithTeam,
-  ScrollingFooter
 } from './ChatStyles';
 
 const { ImageMessage, VideoMessage, AudioMessage, DocumentMessage, MessageFooter, formatDuration } = MediaComponents;
@@ -974,6 +954,19 @@ const ChatApp = () => {
   // State variables
   const [contacts, setContacts] = useState([]);
   const [selectedContact, setSelectedContact] = useState(null);
+  const selectedContactRef = useRef(null);
+   useEffect(() => {
+     selectedContactRef.current = selectedContact;
+     }, [selectedContact]); 
+ 
+  const[allContacts, setAllContacts] = useState([]);   
+  const allContactsRef = useRef([]);
+   useEffect(() => {
+    allContactsRef.current = allContacts;
+     }, [allContacts]); 
+
+  const restoredRef = useRef(false);
+  const blobUrlsRef = useRef({});
   const [messages, setMessages] = useState([]);
   const [newMessage, setNewMessage] = useState("");
   const [showMenu, setShowMenu] = useState(false);
@@ -1003,7 +996,6 @@ const ChatApp = () => {
   const [contactsPage, setContactsPage] = useState(1);
   const [contactsHasMore, setContactsHasMore] = useState(true);
   const [contactsLoading, setContactsLoading] = useState(false);
-  const [allContacts, setAllContacts] = useState([]);
   const [replyingTo, setReplyingTo] = useState(null);
   const [contextMenu, setContextMenu] = useState(null);
 
@@ -1051,6 +1043,8 @@ const ChatApp = () => {
   const mediaRecorderRef = useRef(null);
   const recordingIntervalRef = useRef(null);
   const { user } = useAuth();
+  const location = useLocation();
+  const navigate = useNavigate();
 
   useEffect(() => {
   if ('Notification' in window && Notification.permission === 'default') {
@@ -1073,6 +1067,11 @@ const [isViewAllOrders, setIsViewAllOrders] = useState(false);
 const [showProfilePanel, setShowProfilePanel] = useState(false);
 const [callPermissionStatus, setCallPermissionStatus] = useState(null);
 const [activeCall, setActiveCall] = useState(null);
+
+const notificationTargetPhone = useMemo(() => {
+  const params = new URLSearchParams(location.search);
+  return params.get('phone') || '';
+}, [location.search]);
 
 // Send document flow
 const [showContactPicker, setShowContactPicker] = useState(false);
@@ -1160,15 +1159,13 @@ useEffect(() => {
     const cacheKey = selectedContact.phone_number;
     const cached = ordersCache.current[cacheKey];
 
-    // ✅ Only fetch if cache is empty or older than 2 minutes
     if (!cached || Date.now() - cached.fetchedAt > 2 * 60 * 1000) {
       fetchCustomerOrders();
     } else {
-      // Use cached data immediately
       setCustomerOrders(cached.orders);
     }
   }
-}, [activeProfileTab, selectedContact?.phone_number]);
+}, [activeProfileTab, selectedContact?.phone_number, fetchCustomerOrders]);
 
 const handleDocumentSelect = (e) => {
   const file = e.target.files[0];
@@ -1246,24 +1243,18 @@ const tabCounts = useMemo(() => ({
     };
   }, [selectedContact]);
 
-  // ✅ NEW: Handle contact selection for mobile
-  const handleContactSelectMobile = useCallback(async (contact) => {
-    if (!contact) return;
-
-    // Set the contact
-    await handleContactSelect(contact);
-
-    // On mobile, show chat area after selecting contact
-    if (isMobileView) {
-      setShowChatArea(true);
-    }
-  }, [isMobileView]);
-
-  const handleBackToContacts = useCallback(() => {
+    const handleBackToContacts = useCallback(() => {
   if (isMobileView) {
     setShowChatArea(false);
     setSelectedContact(null);
     setMessages([]);
+    setIsChatLocked(false);
+    setLastCustomerMessageTime(null);
+    setWindowExpiryTime(null);
+    setTimeUntilExpiry(null);
+    setReplyingTo(null);
+    seenEmissionIds.current.clear();
+    processedMessageIds.current.clear();
     sessionStorage.removeItem('lastSelectedPhone');
   }
 }, [isMobileView]);
@@ -1275,9 +1266,11 @@ useEffect(() => {
   setTempNotes('');
   setReplyingTo(null);
   seenEmissionIds.current.clear();
+  processedMessageIds.current.clear();
   setCallPermissionStatus(null);
   setActiveCall(null);
 }, [selectedContact?._id]);
+
 
 // Persist selected contact across refresh
 useEffect(() => {
@@ -1949,11 +1942,11 @@ socket.on('receive_message', (messageData) => {
  // ── END DEDUPLICATION ─────────────────────────────────────
 
   const phoneNumber = messageData.from === 'me' || messageData.from.length > 15
-    ? messageData.to
-    : messageData.from;
+  ? messageData.to
+  : messageData.from;
 
-  const isCurrentlySelected = selectedContact?.phone_number === phoneNumber;
-
+  const isCurrentlySelected = selectedContactRef.current?.phone_number === phoneNumber;
+ 
   // Update contact list (both allContacts and contacts)
   const updateContactInList = (prevContacts) => {
     const existingIndex = prevContacts.findIndex(c => c.phone_number === phoneNumber);
@@ -1984,11 +1977,11 @@ socket.on('receive_message', (messageData) => {
     ? messageData.to
     : messageData.from;
 
-  const isForCurrentChat = selectedContact &&
-    (messagePhone === selectedContact.phone_number ||
-     messageData.to === selectedContact.phone_number);
-
-  if (isForCurrentChat) {
+  const isForCurrentChat = selectedContactRef.current &&
+  (messagePhone === selectedContactRef.current.phone_number ||
+   messageData.to === selectedContactRef.current.phone_number);
+ 
+   if (isForCurrentChat) {
     setMessages(prevMessages => {
       // Secondary safety check (catches edge cases after re-mount)
             const alreadyInState = prevMessages.some(m =>
@@ -2041,15 +2034,15 @@ socket.on('message_sent', (messageData) => {
   setAllContacts(prev => dedupeContacts(updateContactInList(prev)));
   setContacts(prev => dedupeContacts(updateContactInList(prev)));
 
-  const isForCurrentChat = selectedContact && (() => {
-    const contactPhone = selectedContact.phone_number;
-    const messagePhone = messageData.to;
-    const normalizePhone = (phone) => phone.replace(/^\+/, '').replace(/^91/, '');
-    const normalizedContact = normalizePhone(contactPhone);
-    const normalizedMessage = normalizePhone(messagePhone);
-    return contactPhone === messagePhone || normalizedContact === normalizedMessage;
+  const isForCurrentChat = selectedContactRef.current && (() => {
+  const contactPhone = selectedContactRef.current.phone_number;
+  const messagePhone = messageData.to;
+  const normalizePhone = (phone) => phone.replace(/^\+/, '').replace(/^91/, '');
+  const normalizedContact = normalizePhone(contactPhone);
+  const normalizedMessage = normalizePhone(messagePhone);
+  return contactPhone === messagePhone || normalizedContact === normalizedMessage;
   })();
-
+ 
   if (isForCurrentChat) {
     console.log('✅ Message is for current chat');
 
@@ -2064,17 +2057,19 @@ socket.on('message_sent', (messageData) => {
         const updatedMessages = [...prevMessages];
 
         const tempMsg = updatedMessages[tempMessageIndex];
-        if (tempMsg.mediaUrl && tempMsg.mediaUrl.startsWith('blob:')) {
-          URL.revokeObjectURL(tempMsg.mediaUrl);
-        }
+	const blobToRevoke = blobUrlsRef.current[messageData.clientId];
+	if (blobToRevoke) {
+	  URL.revokeObjectURL(blobToRevoke);
+	  delete blobUrlsRef.current[messageData.clientId];
+	}
 
-        updatedMessages[tempMessageIndex] = {
-          ...messageData,
-          from: 'me',
-          _id: messageData._id,
-          _tempFile: false,
-          uploadProgress: undefined
-        };
+	updatedMessages[tempMessageIndex] = {
+	  ...messageData,
+	  from: 'me',
+	  _id: messageData._id,
+	  _tempFile: false,
+	  uploadProgress: undefined
+	};
 
         return updatedMessages.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
       }
@@ -2191,14 +2186,13 @@ socket.on('message_sent', (messageData) => {
           }
         });
 
-        // ✅ Handle Incoming Calls from Customers
-        socket.on('incoming_call', (data) => {
-          if (!isMountedRef.current) return;
+	socket.on('incoming_call', (data) => {
+	  if (!isMountedRef.current) return;
 
-          const callerContact = allContacts.find(c => c.phone_number === data.customerPhone);
-          const callerName = callerContact
-            ? (callerContact.profile_name || callerContact.name || data.customerPhone)
-            : data.customerPhone;
+	  const callerContact = allContactsRef.current.find(c => c.phone_number === data.customerPhone);
+	  const callerName = callerContact
+	    ? (callerContact.profile_name || callerContact.name || data.customerPhone)
+	    : data.customerPhone;
 
           setActiveCall({
             callId: data.callId,
@@ -2268,7 +2262,7 @@ socket.on('message_sent', (messageData) => {
               socketRef.current = null;
             }
           };
-        }, [user, selectedContact?.phone_number, getMessageTypeDisplay]);
+         }, [user, getMessageTypeDisplay]);
 
         // Separate useEffect for joining chat rooms when contact changes
         useEffect(() => {
@@ -2325,19 +2319,20 @@ socket.on('message_sent', (messageData) => {
                 setContactsHasMore(pagination.hasMore);
                 setContactsPage(page);
                 // Restore last selected contact on first load
-		if (page === 1 && !append) {
+                if (page === 1 && !append) {
 		  const lastPhone = sessionStorage.getItem('lastSelectedPhone');
-		  if (lastPhone) {
+		  if (lastPhone && !restoredRef.current) {
 		    const restoredContact = newContacts.find(
 		      c => c.phone_number === lastPhone
 		    );
 		    if (restoredContact) {
+		      restoredRef.current = true;
 		      setTimeout(() => {
 		        handleContactSelect(restoredContact);
 		      }, 300);
 		    }
 		  }
-		}		 
+		}				 		 
               }
             } catch (error) {
               console.error('Failed to load contacts:', error);
@@ -2849,6 +2844,104 @@ useEffect(() => {
           }
         }, [calculate24HourWindow, markMessagesAsRead]);
 
+        // Handle contact selection for mobile — MUST be after handleContactSelect
+        const handleContactSelectMobile = useCallback(async (contact) => {
+          if (!contact) return;
+          await handleContactSelect(contact);
+          if (isMobileView) {
+            setShowChatArea(true);
+          }
+        }, [isMobileView, handleContactSelect]);
+
+
+         useEffect(() => {
+          if (!notificationTargetPhone || !user) {
+            return undefined;
+          }
+
+          const normalizePhoneValue = (phone) =>
+            String(phone || '').replace(/\D/g, '').slice(-10);
+
+          const targetPhone = normalizePhoneValue(notificationTargetPhone);
+          if (!targetPhone) {
+            return undefined;
+          }
+
+          if (normalizePhoneValue(selectedContact?.phone_number) === targetPhone) {
+            navigate('/admin/chats', { replace: true });
+            return undefined;
+          }
+
+          const findMatchingContact = (list = []) =>
+            list.find((contact) => normalizePhoneValue(contact?.phone_number) === targetPhone);
+
+          let cancelled = false;
+
+          const selectNotificationChat = async () => {
+            const localMatch = findMatchingContact([...allContacts, ...contacts]);
+
+            if (localMatch) {
+              await handleContactSelect(localMatch);
+              if (isMobileView) {
+                setShowChatArea(true);
+              }
+              navigate('/admin/chats', { replace: true });
+              return;
+            }
+
+            try {
+              const response = await api.get('/api/contacts', {
+                params: {
+                  search: notificationTargetPhone,
+                  page: 1,
+                  limit: 20,
+                  tab: 'all'
+                }
+              });
+
+              if (cancelled) {
+                return;
+              }
+
+              const fetchedContacts = Array.isArray(response.data?.contacts)
+                ? response.data.contacts
+                : [];
+              const fetchedMatch = findMatchingContact(fetchedContacts);
+
+              if (!fetchedMatch) {
+                return;
+              }
+
+              setAllContacts((prev) => dedupeContacts([...fetchedContacts, ...prev]));
+              setContacts((prev) => dedupeContacts([...fetchedContacts, ...prev]));
+
+              await handleContactSelect(fetchedMatch);
+              if (isMobileView) {
+                setShowChatArea(true);
+              }
+              navigate('/admin/chats', { replace: true });
+            } catch (error) {
+              console.error('Failed to open chat from notification deep link:', error);
+            }
+          };
+
+          selectNotificationChat();
+
+          return () => {
+            cancelled = true;
+          };
+        }, [
+          allContacts,
+          contacts,
+          handleContactSelect,
+          isMobileView,
+          navigate,
+          notificationTargetPhone,
+          selectedContact?.phone_number,
+          user
+        ]);
+
+    
 const answerGlobalCall = useCallback(async () => {
   if (!activeCall?.sdpOffer) return;
 
@@ -3051,21 +3144,27 @@ const answerGlobalCall = useCallback(async () => {
           const clientId = `client-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
           // ✅ Create temp message with preview
-          const tempMessage = {
-            _id: `temp-${clientId}`,
-            clientId: clientId,
-            from: 'me',
-            to: selectedContact.phone_number,
-            type: fileType,
-            text: caption || (fileType === 'document' ? file.name : ''),
-            timestamp: new Date(),
-            status: 'sending',
-            uploadProgress: 0,
-            _tempFile: true,
-            mediaUrl: fileType === 'image' || fileType === 'video'
-              ? URL.createObjectURL(file)
-              : null
-          };
+          const blobUrl = (fileType === 'image' || fileType === 'video')
+	  ? URL.createObjectURL(file)
+	  : null;
+
+		if (blobUrl) {
+		  blobUrlsRef.current[clientId] = blobUrl;
+		}
+
+		const tempMessage = {
+		  _id: `temp-${clientId}`,
+		  clientId: clientId,
+		  from: 'me',
+		  to: selectedContact.phone_number,
+		  type: fileType,
+		  text: caption || (fileType === 'document' ? file.name : ''),
+		  timestamp: new Date(),
+		  status: 'sending',
+		  uploadProgress: 0,
+		  _tempFile: true,
+		  mediaUrl: blobUrl
+		};
 
           // ✅ Add temp message to UI immediately
           setMessages(prev => {
@@ -3118,9 +3217,10 @@ const answerGlobalCall = useCallback(async () => {
             processedMessageIds.current.delete(clientId);
 
             // Cleanup blob URL
-            if (tempMessage.mediaUrl && tempMessage.mediaUrl.startsWith('blob:')) {
-              URL.revokeObjectURL(tempMessage.mediaUrl);
-            }
+       	    if (blobUrlsRef.current[clientId]) {
+	    URL.revokeObjectURL(blobUrlsRef.current[clientId]);
+	    delete blobUrlsRef.current[clientId];
+	    }
 
             if (error.response?.status === 413) {
               toast.error(`File too large. Max 16MB`);

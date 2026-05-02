@@ -1,381 +1,435 @@
-import React, { useState, useEffect } from "react";
-import toast from "react-hot-toast";
-import { publicApi } from "../utils/axios.js";
+/**
+ * components/FileUpload.jsx
+ * Knowledge base upload component.
+ * Sends RAG file + optional website URL to GoWhats backend,
+ * which forwards them to the YoWhats Python Agent.
+ */
+
+import React, { useState, useEffect, useRef } from 'react';
+import { publicApi } from '../utils/axios.js';
+import toast from 'react-hot-toast';
 import {
   Upload,
   FileText,
+  Globe,
   Trash2,
   RefreshCw,
-  AlertCircle,
-  Brain,
-  X,
-  Loader2,
   CheckCircle2,
-  Database,
-  Zap,
-} from "lucide-react";
+  AlertCircle,
+  Loader2,
+  Brain,
+  Link,
+  X
+} from 'lucide-react';
 
-const FileUpload = ({ embedded = false }) => {
-  const [file, setFile] = useState(null);
-  const [uploading, setUploading] = useState(false);
-  const [knowledgeBaseStatus, setKnowledgeBaseStatus] = useState(null);
+const FileUpload = () => {
+  const [kbStatus, setKbStatus] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [uploading, setUploading] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
+
+  // Form state
+  const [selectedFile, setSelectedFile] = useState(null);
+  const [websiteUrl, setWebsiteUrl] = useState('');
+  const [urlError, setUrlError] = useState('');
+
+  const fileInputRef = useRef(null);
 
   useEffect(() => {
-    checkKnowledgeBaseStatus();
+    fetchKbStatus();
   }, []);
 
-  const checkKnowledgeBaseStatus = async () => {
+  const getToken = () => localStorage.getItem('token');
+
+  const fetchKbStatus = async () => {
     try {
       setLoading(true);
-      const token = localStorage.getItem("token");
-      const res = await publicApi.get("/api/bot/knowledge-base-status", {
-        headers: { Authorization: `Bearer ${token}` },
+      const response = await publicApi.get('/api/bot/knowledge-base-status', {
+        headers: { Authorization: `Bearer ${getToken()}` }
       });
-      setKnowledgeBaseStatus(res.data);
+      if (response.data?.success) {
+        setKbStatus(response.data);
+        // Pre-fill website URL if already saved
+        if (response.data.websiteUrl) {
+          setWebsiteUrl(response.data.websiteUrl);
+        }
+      }
     } catch (error) {
-      console.error("Error checking knowledge base status:", error);
-      toast.error("Failed to check knowledge base status");
+      console.error('Error fetching KB status:', error);
+      toast.error('Failed to load knowledge base status');
     } finally {
       setLoading(false);
     }
   };
 
-  const handleFileChange = (e) => {
-    const selected = e.target.files[0];
-    if (!selected) return;
-    if (!selected.name.endsWith(".txt")) {
-      toast.error("Please select a .txt file");
-      e.target.value = "";
+  const validateUrl = (url) => {
+    if (!url) return true; // empty is fine
+    try {
+      const u = new URL(url);
+      return u.protocol === 'http:' || u.protocol === 'https:';
+    } catch {
+      return false;
+    }
+  };
+
+  const handleFileSelect = (file) => {
+    if (!file) return;
+    const allowed = ['.txt', '.pdf', '.csv', '.md', '.json'];
+    const ext = '.' + file.name.split('.').pop().toLowerCase();
+    if (!allowed.includes(ext)) {
+      toast.error(`File type not supported. Use: ${allowed.join(', ')}`);
       return;
     }
-    if (selected.size > 10 * 1024 * 1024) {
-      toast.error("File must be less than 10MB");
-      e.target.value = "";
+    if (file.size > 10 * 1024 * 1024) {
+      toast.error('File too large. Maximum size is 10MB.');
       return;
     }
-    setFile(selected);
+    setSelectedFile(file);
+  };
+
+  const handleDrop = (e) => {
+    e.preventDefault();
+    setDragOver(false);
+    const file = e.dataTransfer.files[0];
+    handleFileSelect(file);
+  };
+
+  const handleUrlChange = (e) => {
+    const val = e.target.value;
+    setWebsiteUrl(val);
+    if (val && !validateUrl(val)) {
+      setUrlError('Please enter a valid URL (starting with https://)');
+    } else {
+      setUrlError('');
+    }
   };
 
   const handleUpload = async () => {
-    if (!file) {
-      toast.error("Please select a file to upload");
+    if (!selectedFile) {
+      toast.error('Please select a file to upload');
       return;
     }
-
-    // Check if upload is already in progress
-    if (uploading) {
-      toast.error("Upload already in progress. Please wait...");
+    if (websiteUrl && !validateUrl(websiteUrl)) {
+      toast.error('Please fix the website URL before uploading');
       return;
     }
-
-    // Check if another upload is in progress from status
-    if (knowledgeBaseStatus?.uploadInProgress) {
-      toast.error("Another upload is in progress. Please wait for it to complete.");
-      return;
-    }
-
-    const token = localStorage.getItem("token");
-    const tenentId = localStorage.getItem("tenentid");
-    
-    if (!token || !tenentId) {
-      toast.error("Authentication error. Please log in again.");
-      return;
-    }
-
-    const formData = new FormData();
-    formData.append("file", file);
-    formData.append("tenentId", tenentId);
 
     setUploading(true);
-
     try {
-      const response = await publicApi.post("/api/bot/upload-knowledge-base", formData, {
-        headers: {
-          "Content-Type": "multipart/form-data",
-          Authorization: `Bearer ${token}`,
-        },
-        timeout: 300000, // 5 minutes timeout
-      });
+      const formData = new FormData();
+      formData.append('file', selectedFile);
+      if (websiteUrl.trim()) {
+        formData.append('websiteUrl', websiteUrl.trim());
+      }
 
-      if (response.data.success) {
+      const response = await publicApi.post(
+        '/api/bot/upload-knowledge-base',
+        formData,
+        {
+          headers: {
+            Authorization: `Bearer ${getToken()}`,
+            'Content-Type': 'multipart/form-data'
+          }
+        }
+      );
+
+      if (response.data?.success) {
         toast.success(
-          `Knowledge base uploaded successfully! ${response.data.stats?.chunksCount || 0} chunks, ${response.data.stats?.embeddingsCount || 0} embeddings created.`,
-          { duration: 5000 }
+          `✅ Knowledge base uploaded! ${response.data.stats?.chunksCount || 0} chunks indexed.`
         );
-        setFile(null);
-        const fileInput = document.getElementById("file-input");
-        if (fileInput) fileInput.value = "";
-        await checkKnowledgeBaseStatus();
+        setSelectedFile(null);
+        if (fileInputRef.current) fileInputRef.current.value = '';
+        await fetchKbStatus();
+      } else {
+        toast.error(response.data?.message || 'Upload failed');
       }
     } catch (error) {
-      console.error("Upload error:", error);
-      const errorMessage = error.response?.data?.message || "Upload failed. Please try again.";
-      toast.error(errorMessage);
+      const msg = error.response?.data?.message || 'Upload failed. Please try again.';
+      toast.error(msg);
     } finally {
       setUploading(false);
     }
   };
 
-  const handleRemove = async () => {
-    if (!window.confirm("Are you sure you want to delete the knowledge base? This action cannot be undone.")) {
-      return;
-    }
-
-    // Prevent deletion during upload
-    if (knowledgeBaseStatus?.uploadInProgress || uploading) {
-      toast.error("Cannot delete knowledge base while upload is in progress");
-      return;
-    }
-
+  const handleDelete = async () => {
+    if (!window.confirm('Delete the knowledge base? The bot will go offline.')) return;
+    setDeleting(true);
     try {
-      const token = localStorage.getItem("token");
-      const tenentId = localStorage.getItem("tenentid");
-      await publicApi.delete("/api/bot/knowledge-base", {
-        headers: { Authorization: `Bearer ${token}` },
-        data: { tenentId },
+      const response = await publicApi.delete('/api/bot/knowledge-base', {
+        headers: { Authorization: `Bearer ${getToken()}` }
       });
-      setKnowledgeBaseStatus(null);
-      toast.success("Knowledge base removed successfully");
-      await checkKnowledgeBaseStatus();
+      if (response.data?.success) {
+        toast.success('Knowledge base deleted. Bot is now offline.');
+        setWebsiteUrl('');
+        setSelectedFile(null);
+        await fetchKbStatus();
+      }
     } catch (error) {
-      console.error("Delete error:", error);
-      const errorMessage = error.response?.data?.message || "Failed to remove knowledge base";
-      toast.error(errorMessage);
+      toast.error('Failed to delete knowledge base');
+    } finally {
+      setDeleting(false);
     }
   };
 
   const formatFileSize = (bytes) => {
-    if (bytes === 0) return "0 Bytes";
-    const k = 1024;
-    const sizes = ["Bytes", "KB", "MB", "GB"];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
+    if (!bytes) return '—';
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   };
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center min-h-[40vh] bg-white">
+      <div className="flex items-center justify-center py-16">
         <div className="text-center">
-          <div className="animate-spin h-10 w-10 border-4 border-gray-200 rounded-full mx-auto mb-3 border-t-[#005E2C]"></div>
-          <p className="text-gray-600 font-medium">Loading AI Assistant...</p>
+          <Loader2 className="w-10 h-10 animate-spin text-emerald-600 mx-auto mb-3" />
+          <p className="text-gray-500 text-sm">Loading knowledge base...</p>
         </div>
       </div>
     );
   }
 
-  const embeddingsCount = knowledgeBaseStatus?.embeddingsCount || 0;
-  const isUploadInProgress = knowledgeBaseStatus?.uploadInProgress || uploading;
+  const hasKB = kbStatus?.hasKnowledgeBase;
+  const uploadInProgress = kbStatus?.uploadInProgress;
 
   return (
-    <div className={`w-full ${embedded ? 'bg-transparent' : 'bg-white'} py-1`}>
-      {/* Header */}
-      <div className="w-full max-w-5xl mx-auto bg-green-50 border border-green-100 rounded-2xl p-4 sm:p-6 flex flex-col sm:flex-row sm:items-center gap-4 shadow-sm">
-        <div className="flex items-start sm:items-center gap-3 sm:gap-4">
-          <div className="w-12 h-12 sm:w-14 sm:h-14 bg-gradient-to-br from-[#005E2C] to-[#00A86B] text-white rounded-xl flex items-center justify-center shadow-md shrink-0">
-            <Brain className="w-7 h-7" />
-          </div>
+    <div className="space-y-6">
+
+      {/* Upload in progress notice */}
+      {uploadInProgress && (
+        <div className="flex items-center space-x-3 p-4 bg-blue-50 border-2 border-blue-200 rounded-xl">
+          <Loader2 className="w-5 h-5 animate-spin text-blue-600 flex-shrink-0" />
           <div>
-            <h1 className="text-xl sm:text-2xl font-semibold text-gray-900 flex flex-wrap items-center gap-2">
-              AI Assistant Configuration
-              {embeddingsCount > 0 && (
-                <span className="text-sm bg-[#E6F4EA] text-[#005E2C] font-medium px-3 py-1 rounded-lg">
-                  {embeddingsCount} Embeddings Processed
-                </span>
-              )}
-            </h1>
-            <p className="text-sm text-gray-600">
-              Manage your AI knowledge base and chatbot intelligence.
+            <p className="text-sm font-bold text-blue-900">Upload in progress</p>
+            <p className="text-xs text-blue-700">Your file is being processed. Please wait...</p>
+          </div>
+        </div>
+      )}
+
+      {/* Current knowledge base info */}
+      {hasKB && !uploadInProgress && (
+        <div className="bg-emerald-50 border-2 border-emerald-200 rounded-xl overflow-hidden">
+          <div className="flex items-center justify-between px-5 py-4 border-b border-emerald-200">
+            <div className="flex items-center space-x-3">
+              <CheckCircle2 className="w-5 h-5 text-emerald-600" />
+              <span className="text-sm font-bold text-emerald-900">Knowledge Base Active</span>
+            </div>
+            <button
+              onClick={fetchKbStatus}
+              className="p-1.5 text-emerald-600 hover:bg-emerald-100 rounded-lg transition-colors"
+            >
+              <RefreshCw className="w-4 h-4" />
+            </button>
+          </div>
+          <div className="px-5 py-4 grid grid-cols-2 gap-4 sm:grid-cols-4">
+            <div>
+              <p className="text-xs text-emerald-700 mb-1">File</p>
+              <p className="text-sm font-semibold text-emerald-900 truncate">
+                {kbStatus.fileName || '—'}
+              </p>
+            </div>
+            <div>
+              <p className="text-xs text-emerald-700 mb-1">Size</p>
+              <p className="text-sm font-semibold text-emerald-900">
+                {formatFileSize(kbStatus.fileSize)}
+              </p>
+            </div>
+            <div>
+              <p className="text-xs text-emerald-700 mb-1">Chunks</p>
+              <p className="text-sm font-semibold text-emerald-900">
+                {kbStatus.chunksCount || 0}
+              </p>
+            </div>
+            <div>
+              <p className="text-xs text-emerald-700 mb-1">Uploaded</p>
+              <p className="text-sm font-semibold text-emerald-900">
+                {kbStatus.uploadedAt
+                  ? new Date(kbStatus.uploadedAt).toLocaleDateString()
+                  : '—'}
+              </p>
+            </div>
+          </div>
+          {kbStatus.websiteUrl && (
+            <div className="px-5 py-3 bg-emerald-100/50 border-t border-emerald-200 flex items-center space-x-2">
+              <Globe className="w-4 h-4 text-emerald-600 flex-shrink-0" />
+              <span className="text-xs text-emerald-800 truncate">{kbStatus.websiteUrl}</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* No knowledge base warning */}
+      {!hasKB && !uploadInProgress && (
+        <div className="flex items-start space-x-3 p-4 bg-amber-50 border-2 border-amber-200 rounded-xl">
+          <AlertCircle className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
+          <div>
+            <p className="text-sm font-bold text-amber-900">No knowledge base uploaded</p>
+            <p className="text-xs text-amber-700 mt-0.5">
+              Upload your product catalog or business info file to enable the AI bot.
             </p>
           </div>
         </div>
-      </div>
+      )}
 
-      {/* Main Card */}
-      <div className="mt-5 sm:mt-6 w-full max-w-5xl mx-auto bg-white border border-gray-200 rounded-2xl shadow-md overflow-hidden">
-        {/* Card Header with Action Buttons */}
-        <div className="bg-gradient-to-r from-green-50 to-emerald-50 border-b border-gray-200 px-4 sm:px-6 py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-          <h2 className="text-lg font-semibold text-gray-900">Knowledge Base Status</h2>
-          <div className="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
-            <button
-              onClick={checkKnowledgeBaseStatus}
-              disabled={loading}
-              className="w-full sm:w-auto px-4 py-2 bg-[#005E2C] text-white rounded-lg text-sm font-medium hover:bg-[#00A86B] transition disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+      {/* ── Upload Form ── */}
+      {!uploadInProgress && (
+        <div className="space-y-5">
+
+          {/* File drop zone */}
+          <div>
+            <label className="block text-sm font-bold text-gray-900 mb-2">
+              {hasKB ? 'Replace Knowledge Base File' : 'Upload Knowledge Base File'}
+              <span className="text-red-500 ml-1">*</span>
+            </label>
+
+            <div
+              onClick={() => fileInputRef.current?.click()}
+              onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+              onDragLeave={() => setDragOver(false)}
+              onDrop={handleDrop}
+              className={`relative border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-all ${
+                dragOver
+                  ? 'border-emerald-500 bg-emerald-50'
+                  : selectedFile
+                    ? 'border-emerald-400 bg-emerald-50/50'
+                    : 'border-gray-300 hover:border-emerald-400 hover:bg-gray-50'
+              }`}
             >
-              <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
-              Refresh
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".txt,.pdf,.csv,.md,.json"
+                className="hidden"
+                onChange={(e) => handleFileSelect(e.target.files[0])}
+              />
+
+              {selectedFile ? (
+                <div className="flex items-center justify-center space-x-3">
+                  <FileText className="w-8 h-8 text-emerald-600" />
+                  <div className="text-left">
+                    <p className="text-sm font-bold text-emerald-900">{selectedFile.name}</p>
+                    <p className="text-xs text-emerald-700">{formatFileSize(selectedFile.size)}</p>
+                  </div>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setSelectedFile(null);
+                      if (fileInputRef.current) fileInputRef.current.value = '';
+                    }}
+                    className="p-1 text-gray-400 hover:text-red-500 transition-colors"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+              ) : (
+                <>
+                  <Upload className="w-10 h-10 text-gray-300 mx-auto mb-3" />
+                  <p className="text-sm font-semibold text-gray-700">
+                    Drop your file here or <span className="text-emerald-600">browse</span>
+                  </p>
+                  <p className="text-xs text-gray-400 mt-1">
+                    Supported: .txt, .pdf, .csv, .md, .json — Max 10MB
+                  </p>
+                </>
+              )}
+            </div>
+          </div>
+
+          {/* Website URL */}
+          <div>
+            <label className="block text-sm font-bold text-gray-900 mb-1.5">
+              Website URL
+              <span className="text-xs font-normal text-gray-400 ml-2">
+                (Optional — for deep search)
+              </span>
+            </label>
+            <p className="text-xs text-gray-500 mb-2">
+              The AI will also search your website when the uploaded file doesn't have the answer.
+            </p>
+            <div className="relative">
+              <Globe className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+              <input
+                type="url"
+                value={websiteUrl}
+                onChange={handleUrlChange}
+                placeholder="https://www.yourwebsite.com"
+                className={`w-full pl-10 pr-4 py-3 border-2 rounded-xl text-sm
+                  focus:outline-none transition-colors ${
+                  urlError
+                    ? 'border-red-300 focus:border-red-400'
+                    : 'border-gray-200 focus:border-emerald-400'
+                }`}
+              />
+            </div>
+            {urlError && (
+              <p className="text-xs text-red-600 mt-1 flex items-center space-x-1">
+                <AlertCircle className="w-3 h-3" />
+                <span>{urlError}</span>
+              </p>
+            )}
+          </div>
+
+          {/* Action buttons */}
+          <div className="flex flex-col sm:flex-row gap-3">
+            <button
+              onClick={handleUpload}
+              disabled={uploading || !selectedFile || !!urlError}
+              className="flex-1 flex items-center justify-center space-x-2 px-6 py-3
+                         bg-gradient-to-r from-emerald-600 to-teal-600 text-white rounded-xl
+                         font-semibold text-sm hover:from-emerald-700 hover:to-teal-700
+                         transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
+            >
+              {uploading ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  <span>Uploading & Indexing...</span>
+                </>
+              ) : (
+                <>
+                  <Brain className="w-4 h-4" />
+                  <span>{hasKB ? 'Replace Knowledge Base' : 'Upload Knowledge Base'}</span>
+                </>
+              )}
             </button>
-            {knowledgeBaseStatus?.hasKnowledgeBase && (
+
+            {hasKB && (
               <button
-                onClick={handleRemove}
-                disabled={isUploadInProgress}
-                className="w-full sm:w-auto px-4 py-2 bg-red-600 text-white rounded-lg text-sm font-medium hover:bg-red-700 transition disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                onClick={handleDelete}
+                disabled={deleting || uploading}
+                className="flex items-center justify-center space-x-2 px-5 py-3
+                           border-2 border-red-200 text-red-600 rounded-xl font-semibold text-sm
+                           hover:bg-red-50 transition-colors disabled:opacity-50"
               >
-                <Trash2 className="w-4 h-4" />
-                Delete
+                {deleting ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Trash2 className="w-4 h-4" />
+                )}
+                <span>{deleting ? 'Deleting...' : 'Delete'}</span>
               </button>
             )}
           </div>
-        </div>
 
-        {/* Card Content */}
-        <div className="p-4 sm:p-6 space-y-6">
-          {knowledgeBaseStatus?.hasKnowledgeBase ? (
-            <div className="bg-gradient-to-r from-green-50 to-emerald-50 border border-green-200 rounded-xl p-4 sm:p-6">
-              <div className="flex items-start gap-3 sm:gap-4">
-                <div className="w-10 h-10 sm:w-12 sm:h-12 bg-[#005E2C] rounded-xl flex items-center justify-center flex-shrink-0">
-                  <CheckCircle2 className="w-6 h-6 text-white" />
-                </div>
-                <div className="flex-1 space-y-3">
-                  <h3 className="text-lg font-bold text-gray-900">Knowledge Base Active</h3>
-                  
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
-                    <div className="flex items-center gap-2">
-                      <FileText className="w-4 h-4 text-[#005E2C]" />
-                      <span className="text-gray-700">
-                        <strong>File:</strong> {knowledgeBaseStatus.fileName}
-                      </span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <Database className="w-4 h-4 text-[#005E2C]" />
-                      <span className="text-gray-700">
-                        <strong>Size:</strong> {formatFileSize(knowledgeBaseStatus.fileSize)}
-                      </span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <Database className="w-4 h-4 text-[#005E2C]" />
-                      <span className="text-gray-700">
-                        <strong>Chunks:</strong> {knowledgeBaseStatus.chunksCount || 0}
-                      </span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <Zap className="w-4 h-4 text-[#005E2C]" />
-                      <span className="text-[#005E2C] font-semibold">
-                        <strong>Embeddings:</strong> {embeddingsCount}
-                      </span>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          ) : (
-            <div className="flex flex-col items-center justify-center py-8 text-gray-600 border-2 border-dashed border-gray-300 rounded-2xl bg-gray-50">
-              <AlertCircle className="w-12 h-12 text-[#00A86B] mb-3" />
-              <p className="text-base font-medium">No active knowledge base found</p>
-              <p className="text-sm text-gray-500 mt-1">Upload a .txt file to get started</p>
-            </div>
-          )}
-
-          {/* Upload Section */}
-          <div className="space-y-4">
-            <div className="border-t border-gray-200 pt-6">
-              <h3 className="text-lg font-semibold text-gray-900 mb-4">
-                {knowledgeBaseStatus?.hasKnowledgeBase ? 'Update Knowledge Base' : 'Upload Knowledge Base'}
-              </h3>
-
-              <div
-                className={`w-full border-2 border-dashed rounded-2xl p-4 sm:p-6 flex flex-col items-center justify-center transition-all ${
-                  file ? "border-[#00A86B] bg-green-50" : "border-gray-300 hover:border-[#00A86B]"
-                } ${isUploadInProgress ? "opacity-50 pointer-events-none" : ""}`}
-              >
-                {!file ? (
-                  <>
-                    <div className="w-16 h-16 bg-[#E6F4EA] rounded-2xl flex items-center justify-center mb-4">
-                      <Upload className="w-8 h-8 text-[#005E2C]" />
-                    </div>
-                    <label
-                      htmlFor="file-input"
-                      className={`cursor-pointer inline-flex items-center px-6 py-3 bg-[#005E2C] text-white rounded-lg hover:bg-[#00A86B] transition font-semibold ${
-                        isUploadInProgress ? "opacity-50 cursor-not-allowed pointer-events-none" : ""
-                      }`}
-                    >
-                      <Upload className="w-5 h-5 mr-2" /> Choose File
-                    </label>
-                    <input
-                      id="file-input"
-                      type="file"
-                      accept=".txt"
-                      className="hidden"
-                      onChange={handleFileChange}
-                      disabled={isUploadInProgress}
-                    />
-                    <p className="text-xs text-gray-500 mt-3">
-                      Upload a .txt file with your business details (max 10MB)
-                    </p>
-                  </>
-                ) : (
-                  <div className="bg-white border border-gray-200 rounded-xl p-4 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 w-full">
-                    <div className="flex items-center space-x-3 min-w-0">
-                      <FileText className="w-6 h-6 text-[#005E2C]" />
-                      <div className="min-w-0">
-                        <p className="font-medium text-gray-800 break-all">
-                          {file.name}
-                        </p>
-                        <p className="text-xs text-gray-600">
-                          {formatFileSize(file.size)}
-                        </p>
-                      </div>
-                    </div>
-                    <button
-                      onClick={() => {
-                        setFile(null);
-                        const fileInput = document.getElementById("file-input");
-                        if (fileInput) fileInput.value = "";
-                      }}
-                      disabled={uploading}
-                      className="p-2 text-red-500 hover:bg-red-50 rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed"
-                    >
-                      <X className="w-5 h-5" />
-                    </button>
-                  </div>
-                )}
-              </div>
-
-              {/* Upload Button - ONLY LOADING INDICATOR */}
-              <button
-                onClick={handleUpload}
-                disabled={!file || isUploadInProgress}
-                className={`mt-4 w-full py-3 rounded-xl font-semibold text-white transition flex items-center justify-center gap-2 ${
-                  isUploadInProgress || !file
-                    ? "bg-gray-300 text-gray-600 cursor-not-allowed"
-                    : "bg-gradient-to-r from-[#005E2C] to-[#00A86B] hover:from-[#00A86B] hover:to-[#005E2C]"
-                }`}
-              >
-                {uploading ? (
-                  <>
-                    <Loader2 className="w-5 h-5 animate-spin" />
-                    <span className="text-sm sm:text-base">Processing... This may take a few minutes</span>
-                  </>
-                ) : (
-                  <>
-                    <Upload className="w-5 h-5" />
-                    <span className="text-sm sm:text-base">Upload Knowledge Base</span>
-                  </>
-                )}
-              </button>
-            </div>
-          </div>
-
-          {/* Info Box */}
-          <div className="bg-gradient-to-r from-blue-50 to-indigo-50 rounded-xl p-5 border border-blue-200">
-            <div className="flex items-start gap-3">
-              <AlertCircle className="w-5 h-5 text-blue-600 flex-shrink-0 mt-0.5" />
+          {/* Info note */}
+          <div className="bg-blue-50 rounded-xl p-4 border border-blue-100">
+            <div className="flex items-start space-x-3">
+              <Brain className="w-5 h-5 text-blue-600 flex-shrink-0 mt-0.5" />
               <div>
-                <h4 className="text-sm font-bold text-blue-900 mb-2">How Knowledge Base Works:</h4>
+                <p className="text-sm font-semibold text-blue-900 mb-1">How it works</p>
                 <ul className="text-xs text-blue-800 space-y-1">
-                  <li>1. Upload your business information as a .txt file</li>
-                  <li>2. AI automatically chunks and creates embeddings</li>
-                  <li>3. Enable the bot to start responding to customer queries</li>
-                  <li>4. Bot uses RAG (Retrieval Augmented Generation) for accurate responses</li>
+                  <li>• Your file is sent to the AI agent and indexed using FAISS vectors</li>
+                  <li>• Claude uses these vectors to answer customer WhatsApp questions</li>
+                  <li>• If a website URL is added, the AI also searches it as a fallback</li>
+                  <li>• Indexing usually takes 10–60 seconds depending on file size</li>
                 </ul>
               </div>
             </div>
           </div>
         </div>
-      </div>
+      )}
     </div>
   );
 };
 
 export default FileUpload;
-

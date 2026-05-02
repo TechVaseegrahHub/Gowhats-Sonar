@@ -28,6 +28,22 @@ function Layout() {
   useEffect(() => {
     const params = new URLSearchParams(location.search);
     const sessionId = params.get('stripe_session_id');
+    const shopifyBillingStatus = params.get('shopify_billing');
+
+    if (shopifyBillingStatus) {
+      if (shopifyBillingStatus === 'active') {
+        toast.success('Shopify subscription active. Pro plan enabled.');
+        refreshSubscription();
+      } else if (shopifyBillingStatus === 'pending') {
+        toast('Shopify billing approval is still pending.');
+        refreshSubscription();
+      } else if (shopifyBillingStatus === 'error') {
+        toast.error('Shopify billing could not be verified.');
+      }
+      navigate(location.pathname, { replace: true });
+      return;
+    }
+
     if (!sessionId) return;
 
     const verifyStripePayment = async () => {

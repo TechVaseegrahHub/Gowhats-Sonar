@@ -43,7 +43,7 @@ const settingsSchema = new mongoose.Schema({
       // ── Which gateway is active for this tenant ──────────
       paymentGateway: {
         type:    String,
-        enum:    ['razorpay', 'stripe', 'cashfree'],
+        enum:    ['razorpay', 'stripe', 'cashfree', 'hitpay'],
         default: 'razorpay'
       },
 
@@ -69,6 +69,15 @@ const settingsSchema = new mongoose.Schema({
         notifyUrl:                { type: String, default: '' },
         currency:                 { type: String, default: 'INR' },
       },
+
+	// ── HitPay (per-tenant credentials) ──────────────────
+	hitpayConfig: {
+	  apiKey:      { type: String, default: '' },
+	  webhookSalt: { type: String, default: '' },
+	  environment: { type: String, enum: ['sandbox', 'production'], default: 'production' },
+	  currency:    { type: String, default: 'SGD' },
+	  successUrl:  { type: String, default: '' },
+	},
 
       // ── Shared message template ───────────────────────────
       template: {
@@ -173,7 +182,33 @@ const settingsSchema = new mongoose.Schema({
       zipCode:  { type: String, default: '' },
       phone:    { type: String, default: '' }
     },
-    labelFormat: { type: String, enum: ['thermal', 'thermal6', 'a4'], default: 'thermal' }
+    labelFormat: { type: String, enum: ['thermal', 'thermal6', 'a4'], default: 'thermal' },
+    printerConnection: {
+      type: {
+        type: String,
+        enum: ['browser', 'network', 'bluetooth', 'usb'],
+        default: 'browser'
+      },
+      network: {
+        host: { type: String, default: '' },
+        port: { type: Number, default: 9100 }
+      },
+      paperWidth: {
+        type: String,
+        enum: ['58mm', '80mm', '4x4', '4x6', 'a4'],
+        default: '4x4'
+      },
+      autoPrintOnSale: { type: Boolean, default: false },
+      printMode: {
+        type: String,
+        enum: ['pdf', 'graphical', 'text'],
+        default: 'pdf'
+      },
+      lastSelectedAt: { type: Date, default: null },
+      status: { type: String, default: 'Not configured' },
+      deviceLabel: { type: String, default: '' },
+      lastTestedAt: { type: Date, default: null }
+    }
   },
 
   // AI Configuration
@@ -188,8 +223,9 @@ const settingsSchema = new mongoose.Schema({
     chatModel:                 { type: String,  default: '' },
     visionModel:               { type: String,  default: '' },
     embeddingModel:            { type: String,  default: '' },
-    productImageFetchEnabled:  { type: Boolean, default: false }
-  },
+    productImageFetchEnabled:  { type: Boolean, default: false },
+    cloudinaryImageUploadEnabled: { type: Boolean, default: false }
+},
 
   fieldMapping: { type: Map, of: String },
 

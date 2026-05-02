@@ -78,6 +78,137 @@ class ShopifyApiService {
     }
   }
 
+  async makeGraphQLRequest(query, variables = {}) {
+    const fullUrl = `${this.baseUrl}/graphql.json`;
+    console.log(`   [Shopify API Service] Making GraphQL request: ${fullUrl}`);
+
+    try {
+      const response = await axios({
+        method: 'POST',
+        url: fullUrl,
+        headers: {
+          'X-Shopify-Access-Token': this.adminAccessToken,
+          'Content-Type': 'application/json'
+        },
+        data: { query, variables }
+      });
+
+      if (Array.isArray(response.data?.errors) && response.data.errors.length > 0) {
+        const error = new Error(response.data.errors.map((item) => item.message).join('; '));
+        error.response = { data: response.data, status: response.status };
+        throw error;
+      }
+
+      return response.data?.data || {};
+    } catch (error) {
+      console.error('   [Shopify API Service] GraphQL request failed');
+      if (error.response) {
+        console.error(`   - Status: ${error.response.status}`);
+        console.error(`   - Data: ${JSON.stringify(error.response.data)}`);
+      } else {
+        console.error('   - Error:', error.message);
+      }
+      throw error;
+    }
+  }
+
+  async getActiveAppSubscriptions() {
+    const data = await this.makeGraphQLRequest(`
+      query GoWhatsActiveSubscriptions {
+        currentAppInstallation {
+          activeSubscriptions {
+            id
+            name
+            status
+            test
+            trialDays
+            createdAt
+            currentPeriodEnd
+            lineItems {
+              plan {
+                pricingDetails {
+                  ... on AppRecurringPricing {
+                    interval
+                    price {
+                      amount
+                      currencyCode
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    `);
+
+    return data?.currentAppInstallation?.activeSubscriptions || [];
+  }
+
+  async createRecurringAppSubscription({
+    name,
+    amount,
+    currencyCode = 'USD',
+    returnUrl,
+    interval = 'EVERY_30_DAYS',
+    test = false,
+    trialDays = 0
+  }) {
+    const data = await this.makeGraphQLRequest(`
+      mutation GoWhatsAppSubscriptionCreate(
+        $name: String!,
+        $returnUrl: URL!,
+        $lineItems: [AppSubscriptionLineItemInput!]!,
+        $test: Boolean,
+        $trialDays: Int
+      ) {
+        appSubscriptionCreate(
+          name: $name,
+          returnUrl: $returnUrl,
+          lineItems: $lineItems,
+          test: $test,
+          trialDays: $trialDays,
+          replacementBehavior: APPLY_IMMEDIATELY
+        ) {
+          userErrors {
+            field
+            message
+          }
+          confirmationUrl
+          appSubscription {
+            id
+            status
+          }
+        }
+      }
+    `, {
+      name,
+      returnUrl,
+      test: Boolean(test),
+      trialDays: Number(trialDays || 0),
+      lineItems: [
+        {
+          plan: {
+            appRecurringPricingDetails: {
+              price: {
+                amount: Number(amount),
+                currencyCode: String(currencyCode || 'USD').toUpperCase()
+              },
+              interval
+            }
+          }
+        }
+      ]
+    });
+
+    const payload = data?.appSubscriptionCreate || {};
+    if (Array.isArray(payload.userErrors) && payload.userErrors.length > 0) {
+      throw new Error(payload.userErrors.map((item) => item.message).join('; '));
+    }
+
+    return payload;
+  }
+
   async verifyConnection() {
     const response = await this.makeRequest('/shop.json');
     return response.shop;

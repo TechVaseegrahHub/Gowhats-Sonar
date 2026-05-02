@@ -6,63 +6,117 @@ const Tenant = require('../models/Tenant');
 const IntegrationService = require('../services/integrationService');
 const crypto = require('crypto');
 
-// Initialize integration service
 const integrationService = new IntegrationService();
 
+// ==========================================
+// ✅ Shared: Shopify HMAC verification (replaces dead duplicate below)
+// ==========================================
+function verifyShopifyWebhook(rawBody, hmac, secret) {
+  if (!hmac || !secret || !rawBody) {
+    console.log('Missing HMAC, secret, or raw body for Shopify webhook');
+    return false;
+  }
+  try {
+    const body = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(rawBody);
+    const calculatedHmac = crypto
+      .createHmac('sha256', secret)
+      .update(body)
+      .digest('base64');
+    return crypto.timingSafeEqual(
+      Buffer.from(calculatedHmac),
+      Buffer.from(hmac)
+    );
+  } catch (error) {
+    console.error('Shopify webhook verification error:', error);
+    return false;
+  }
+}
+
+// ==========================================
+// ✅ Shared: WooCommerce HMAC verification (was missing entirely)
+// ==========================================
+function verifyWooCommerceWebhook(rawBody, signature, secret) {
+  if (!signature || !secret || !rawBody) {
+    console.log('Missing signature, secret, or raw body for WooCommerce webhook');
+    return false;
+  }
+  try {
+    const body = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(rawBody);
+    const calculatedHmac = crypto
+      .createHmac('sha256', secret)
+      .update(body)
+      .digest('base64');
+    return crypto.timingSafeEqual(
+      Buffer.from(calculatedHmac),
+      Buffer.from(signature)
+    );
+  } catch (error) {
+    console.error('WooCommerce webhook verification error:', error);
+    return false;
+  }
+}
+
+// ==========================================
 // Shopify webhook handler
+// ==========================================
 router.post('/shopify/:integrationId', async (req, res) => {
   try {
     const integrationId = req.params.integrationId;
-    
-    // Find the integration
+
     const integration = await Integration.findById(integrationId);
     if (!integration) {
       console.error(`Integration not found: ${integrationId}`);
       return res.status(404).json({ error: 'Integration not found' });
     }
 
-    // Get webhook topic and hmac
     const topic = req.headers['x-shopify-topic'] || 'unknown';
     const hmac = req.headers['x-shopify-hmac-sha256'];
-    const shopifyDomain = req.headers['x-shopify-shop-domain'];
-    
-let isVerified = false;
-if (integration.webhookSecret && hmac && req.rawBody) {
-  try {
-    const calculatedHmac = crypto
-      .createHmac('sha256', integration.webhookSecret)
-      .update(req.rawBody)
-      .digest('base64');
-    
-    isVerified = calculatedHmac === hmac;
-    
-    if (!isVerified) {
-      console.log('Webhook verification failed. Expected:', hmac);
-      console.log('Calculated:', calculatedHmac);
-      // Continue anyway for testing
-    }
-  } catch (error) {
-    console.error('Error during signature verification:', error);
+
+    // ✅ FIX 1: Verification failure now BLOCKS processing instead of continuing silently.
+    // Previously the code logged a warning but still processed the request — a critical
+    // security hole that allowed anyone to forge Shopify webhooks.
+    if (integration.webhookSecret) {
+      if (!hmac || !req.rawBody) {
+        console.error('Shopify webhook missing HMAC or raw body — rejecting');
+        return res.status(401).json({ error: 'Missing webhook signature' });
+      }
+
+      const isVerified = verifyShopifyWebhook(req.rawBody, hmac, integration.webhookSecret);
+      if (!isVerified) {
+        console.error('Shopify webhook HMAC verification failed — rejecting forged request');
         return res.status(401).json({ error: 'Invalid webhook signature' });
       }
     }
 
-    // Get the tenant associated with this integration
     const tenant = await Tenant.findById(integration.tenantId);
     if (!tenant) {
       console.error(`Tenant not found for integration: ${integrationId}`);
       return res.status(404).json({ error: 'Tenant not found' });
     }
 
-    // Process based on webhook topic
-    switch(topic) {
+    // ✅ FIX 3: Split orders/create and orders/updated so customers don't receive
+    // duplicate "order confirmed" messages on every order update (e.g. shipping label creation).
+    switch (topic) {
       case 'orders/create':
         await integrationService.handleOrderConfirmation(req.body, tenant, 'shopify');
         break;
       case 'orders/updated':
-        await integrationService.handleOrderConfirmation(req.body, tenant, 'shopify');
+        // Use a separate handler for updates — do NOT re-trigger order confirmation.
+        if (integrationService.handleOrderUpdate) {
+          await integrationService.handleOrderUpdate(req.body, tenant, 'shopify');
+        } else {
+          console.log('No handleOrderUpdate defined in integrationService — skipping');
+        }
         break;
+      // ✅ FIX 4: carts/create should NOT trigger abandoned cart logic immediately.
+      // The cart was just created — schedule or track it, don't fire a message yet.
       case 'carts/create':
+        if (integrationService.handleCartCreated) {
+          await integrationService.handleCartCreated(req.body, tenant, 'shopify');
+        } else {
+          console.log('Cart created — no handler defined, storing for future abandoned cart check');
+        }
+        break;
       case 'carts/update':
         await integrationService.handleAbandonedCart(req.body, tenant, 'shopify');
         break;
@@ -70,14 +124,12 @@ if (integration.webhookSecret && hmac && req.rawBody) {
         console.log(`Unhandled Shopify webhook topic: ${topic}`);
     }
 
-    // Always acknowledge receipt
-    return res.status(200).json({
-      success: true,
-      message: 'Webhook processed successfully'
-    });
+    return res.status(200).json({ success: true, message: 'Webhook processed successfully' });
+
   } catch (error) {
     console.error('Shopify webhook processing error:', error);
-    // Still return 200 to avoid retries
+    // Return 200 to prevent Shopify from endlessly retrying transient errors.
+    // Log properly so you can investigate.
     return res.status(200).json({
       success: false,
       message: 'Webhook received with errors',
@@ -86,35 +138,61 @@ if (integration.webhookSecret && hmac && req.rawBody) {
   }
 });
 
+// ==========================================
 // WooCommerce webhook handler
+// ==========================================
 router.post('/woocommerce/:integrationId', async (req, res) => {
   try {
     const { integrationId } = req.params;
-    
-    // Find integration
+
     const integration = await Integration.findById(integrationId);
     if (!integration) {
       return res.status(404).json({ error: 'Integration not found' });
     }
 
-    // Find tenant
+    // ✅ FIX 2: Added HMAC verification — WooCommerce sends x-wc-webhook-signature.
+    // Previously this handler had ZERO signature checking, accepting any forged request.
+    if (integration.webhookSecret) {
+      const signature = req.headers['x-wc-webhook-signature'];
+      if (!signature || !req.rawBody) {
+        console.error('WooCommerce webhook missing signature or raw body — rejecting');
+        return res.status(401).json({ error: 'Missing webhook signature' });
+      }
+
+      const isVerified = verifyWooCommerceWebhook(req.rawBody, signature, integration.webhookSecret);
+      if (!isVerified) {
+        console.error('WooCommerce webhook HMAC verification failed — rejecting');
+        return res.status(401).json({ error: 'Invalid webhook signature' });
+      }
+    }
+
     const tenant = await Tenant.findById(integration.tenantId);
     if (!tenant) {
       return res.status(404).json({ error: 'Tenant not found' });
     }
 
-    // Determine webhook type
     const webhookTopic = req.headers['x-wc-webhook-topic'];
 
-    // Process different webhook types
-    switch(webhookTopic) {
+    // ✅ FIX 3 & 4: Same split applied — order.created vs order.updated,
+    // and cart.created should not immediately trigger abandoned cart logic.
+    switch (webhookTopic) {
       case 'order.created':
         await integrationService.handleOrderConfirmation(req.body, tenant, 'woocommerce');
         break;
       case 'order.updated':
-        await integrationService.handleOrderConfirmation(req.body, tenant, 'woocommerce');
+        if (integrationService.handleOrderUpdate) {
+          await integrationService.handleOrderUpdate(req.body, tenant, 'woocommerce');
+        } else {
+          console.log('No handleOrderUpdate defined — skipping WooCommerce order.updated');
+        }
         break;
       case 'cart.created':
+        if (integrationService.handleCartCreated) {
+          await integrationService.handleCartCreated(req.body, tenant, 'woocommerce');
+        } else {
+          console.log('Cart created — no handler defined, storing for future abandoned cart check');
+        }
+        break;
       case 'cart.updated':
         await integrationService.handleAbandonedCart(req.body, tenant, 'woocommerce');
         break;
@@ -122,35 +200,12 @@ router.post('/woocommerce/:integrationId', async (req, res) => {
         console.log(`Unhandled WooCommerce webhook topic: ${webhookTopic}`);
     }
 
-    // Always return 200 to acknowledge receipt
     return res.status(200).send('Webhook received and processed');
+
   } catch (error) {
     console.error('Webhook processing error:', error);
     return res.status(200).send('Webhook received with errors');
   }
 });
-
-// Verify Shopify webhook signature
-function verifyShopifyWebhook(body, hmac, secret) {
-  if (!hmac || !secret) {
-    console.log('Missing HMAC or secret for Shopify webhook');
-    return false;
-  }
-
-  try {
-    // Ensure body is a string
-    const stringBody = typeof body === 'string' ? body : body.toString();
-    
-    const calculatedHmac = crypto
-      .createHmac('sha256', secret)
-      .update(stringBody)
-      .digest('base64');
-    
-    return calculatedHmac === hmac;
-  } catch (error) {
-    console.error('Shopify webhook verification error:', error);
-    return false;
-  }
-}
 
 module.exports = router;

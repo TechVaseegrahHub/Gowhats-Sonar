@@ -5,6 +5,7 @@ const Message = require('../models/Message');
 const Order = require('../models/Order');
 const Settings = require('../models/settings');
 const { isEncryptionEnabled, hashPhone, normalizePhone } = require('../utils/encryption');
+const { buildOrderFlowPrefill } = require('../utils/orderFlowPrefill');
 
 // In-memory map to track active timers (Key: "TenantID-PhoneNumber")
 const activeTimers = new Map();
@@ -254,6 +255,10 @@ const scheduleReminder = async (platform, cartData, integration) => {
 
     // ✅ FIX: Use the specific delay from Integration Settings (or default to 30)
     const delayMinutes = integration.abandonedCartDelay || 30;
+    const prefill = buildOrderFlowPrefill(cartData, {
+      fallbackPhone: formattedPhone,
+      fallbackName: customerName
+    });
     
     // Calculate trigger time
     const reminderAt = new Date(Date.now() + delayMinutes * 60 * 1000);
@@ -265,7 +270,7 @@ const scheduleReminder = async (platform, cartData, integration) => {
       {
         customerPhone: formattedPhone,
         customerName: customerName,
-        cartDetails: { items, total: cartTotal, currency, checkoutUrl },
+        cartDetails: { items, total: cartTotal, currency, checkoutUrl, prefill },
         reminderAt: reminderAt,
         status: 'pending'
       },

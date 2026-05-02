@@ -60,6 +60,9 @@ const AdminDashboard = () => {
   const [productImageModuleByTenant, setProductImageModuleByTenant] = useState({});
   const [productImageStatusLoadingTenantId, setProductImageStatusLoadingTenantId] = useState('');
   const [productImageToggleLoadingTenantId, setProductImageToggleLoadingTenantId] = useState('');
+  const [cloudinaryUploadModuleByTenant, setCloudinaryUploadModuleByTenant] = useState({});
+  const [cloudinaryUploadStatusLoadingTenantId, setCloudinaryUploadStatusLoadingTenantId] = useState('');
+  const [cloudinaryUploadToggleLoadingTenantId, setCloudinaryUploadToggleLoadingTenantId] = useState('');
 
   // Admin Authentication State
   const [isAuthenticated, setIsAuthenticated] = useState(!!localStorage.getItem('admin_token'));
@@ -80,6 +83,7 @@ const AdminDashboard = () => {
   useEffect(() => {
     if (isAuthenticated && selectedTenant?._id) {
       fetchTenantProductImageModuleStatus(selectedTenant._id, { silent: true });
+      fetchTenantCloudinaryUploadModuleStatus(selectedTenant._id, { silent: true });
     }
   }, [isAuthenticated, selectedTenant?._id]);
 
@@ -114,9 +118,21 @@ const AdminDashboard = () => {
       setLoading(true);
       const response = await publicApi.get('/api/admin-dashboard/all-tenants', {
         headers: getAdminHeaders(),
-      });
+         });
       if (response.data.success) {
         setTenants(response.data.tenants);
+        setProductImageModuleByTenant(
+          response.data.tenants.reduce((accumulator, tenant) => {
+            accumulator[tenant._id] = Boolean(tenant?.featureModules?.productImageFetchEnabled);
+            return accumulator;
+          }, {})
+        );
+        setCloudinaryUploadModuleByTenant(
+          response.data.tenants.reduce((accumulator, tenant) => {
+            accumulator[tenant._id] = tenant?.featureModules?.cloudinaryImageUploadEnabled !== false;
+            return accumulator;
+          }, {})
+        );
       }
     } catch (error) {
       console.error('Error fetching tenants:', error);
@@ -203,7 +219,80 @@ const AdminDashboard = () => {
         toast.error(error?.response?.data?.message || 'Failed to update Product Image AI module');
       }
     } finally {
-      setProductImageToggleLoadingTenantId((prev) => (prev === tenantId ? '' : prev));
+    setProductImageToggleLoadingTenantId((prev) => (prev === tenantId ? '' : prev));
+    }
+  };
+
+  const fetchTenantCloudinaryUploadModuleStatus = async (tenantId, { silent = false } = {}) => {
+    if (!tenantId) return;
+
+    try {
+      setCloudinaryUploadStatusLoadingTenantId(tenantId);
+      const response = await publicApi.get(
+        `/api/admin-dashboard/tenant/${tenantId}/cloudinary-image-upload-module`,
+        { headers: getAdminHeaders() }
+      );
+
+      if (response.data?.success) {
+        setCloudinaryUploadModuleByTenant((prev) => ({
+          ...prev,
+          [tenantId]: Boolean(response.data.enabled)
+        }));
+      }
+    } catch (error) {
+      console.error('Error fetching Cloudinary image upload module status:', error);
+      const status = error?.response?.status;
+      if (status === 401 || status === 403) {
+        localStorage.removeItem('admin_token');
+        setIsAuthenticated(false);
+        toast.error('Admin session expired. Please login again.');
+      } else if (!silent) {
+        toast.error('Failed to load Cloudinary image upload module status');
+      }
+    } finally {
+      setCloudinaryUploadStatusLoadingTenantId((prev) => (prev === tenantId ? '' : prev));
+    }
+  };
+
+  const handleTenantCloudinaryUploadModuleToggle = async (tenantId) => {
+    if (!tenantId) return;
+
+    const currentEnabled =
+      typeof cloudinaryUploadModuleByTenant[tenantId] === 'boolean'
+        ? cloudinaryUploadModuleByTenant[tenantId]
+        : true;
+    const nextEnabled = !currentEnabled;
+
+    try {
+      setCloudinaryUploadToggleLoadingTenantId(tenantId);
+      const response = await publicApi.patch(
+        `/api/admin-dashboard/tenant/${tenantId}/cloudinary-image-upload-module`,
+        { enabled: nextEnabled },
+        { headers: getAdminHeaders() }
+      );
+
+      if (response.data?.success) {
+        const enabled = Boolean(response.data.enabled);
+        setCloudinaryUploadModuleByTenant((prev) => ({
+          ...prev,
+          [tenantId]: enabled
+        }));
+        toast.success(`Cloudinary image upload ${enabled ? 'enabled' : 'disabled'} for this tenant`);
+      } else {
+        throw new Error(response.data?.message || 'Failed to update Cloudinary image upload module');
+      }
+    } catch (error) {
+      console.error('Error toggling Cloudinary image upload module:', error);
+      const status = error?.response?.status;
+      if (status === 401 || status === 403) {
+        localStorage.removeItem('admin_token');
+        setIsAuthenticated(false);
+        toast.error('Admin session expired. Please login again.');
+      } else {
+        toast.error(error?.response?.data?.message || 'Failed to update Cloudinary image upload module');
+      }
+    } finally {
+      setCloudinaryUploadToggleLoadingTenantId((prev) => (prev === tenantId ? '' : prev));
     }
   };
 
@@ -471,6 +560,11 @@ const AdminDashboard = () => {
       ? productImageModuleByTenant[selectedTenant._id]
       : false)
     : false;
+  const selectedTenantCloudinaryUploadEnabled = selectedTenant
+    ? (typeof cloudinaryUploadModuleByTenant[selectedTenant._id] === 'boolean'
+      ? cloudinaryUploadModuleByTenant[selectedTenant._id]
+      : true)
+    : true;
   const selectedTenantSubscription = selectedTenant?.subscription || {};
   const selectedTenantHistory = Array.isArray(selectedTenantSubscription.history)
     ? selectedTenantSubscription.history
@@ -480,6 +574,10 @@ const AdminDashboard = () => {
     !!selectedTenant && productImageStatusLoadingTenantId === selectedTenant._id;
   const isSelectedTenantProductImageUpdating =
     !!selectedTenant && productImageToggleLoadingTenantId === selectedTenant._id;
+  const isSelectedTenantCloudinaryUploadLoading =
+    !!selectedTenant && cloudinaryUploadStatusLoadingTenantId === selectedTenant._id;
+  const isSelectedTenantCloudinaryUploadUpdating =
+    !!selectedTenant && cloudinaryUploadToggleLoadingTenantId === selectedTenant._id;
   const isSelectedTenantPaymentUpdating =
     !!selectedTenant && updatingPaymentTenantId === selectedTenant._id;
 
@@ -1509,11 +1607,11 @@ const AdminDashboard = () => {
                     </div>
                   </section>
 
-                  {/* Product Image AI Module (Admin Only) */}
+		     {/* Tenant Feature Controls */}
                   <section>
                     <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-3 flex items-center gap-2">
                       <Layers className="w-3 h-3" />
-                      AI Module Controls
+                      Feature Controls
                     </h3>
                     <div className="bg-slate-50 rounded-xl p-4 border border-slate-100 space-y-3">
                       <div className="flex items-center justify-between gap-3 p-3 bg-white rounded-xl border border-slate-100">
@@ -1535,6 +1633,30 @@ const AdminDashboard = () => {
                           ) : (
                             <span
                               className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform duration-300 shadow-sm ${selectedTenantProductImageEnabled ? 'translate-x-6' : 'translate-x-1'}`}
+                            />
+                          )}
+                        </button>
+                      </div>
+
+                      <div className="flex items-center justify-between gap-3 p-3 bg-white rounded-xl border border-slate-100">
+                        <div>
+                          <p className="text-sm font-semibold text-slate-800">Upload Image To Cloudinary</p>
+                          <p className="text-[11px] text-slate-500 mt-0.5">
+                            Control whether this tenant can upload inventory images from device to Cloudinary.
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => handleTenantCloudinaryUploadModuleToggle(selectedTenant._id)}
+                          disabled={isSelectedTenantCloudinaryUploadLoading || isSelectedTenantCloudinaryUploadUpdating}
+                          className={`relative inline-flex h-6 w-11 items-center rounded-full transition-all duration-300 ${selectedTenantCloudinaryUploadEnabled ? 'bg-emerald-500' : 'bg-slate-300'} ${(isSelectedTenantCloudinaryUploadLoading || isSelectedTenantCloudinaryUploadUpdating) ? 'opacity-60 cursor-not-allowed' : ''}`}
+                          title="Toggle Cloudinary image upload"
+                        >
+                          {(isSelectedTenantCloudinaryUploadLoading || isSelectedTenantCloudinaryUploadUpdating) ? (
+                            <RefreshCw className="absolute left-1/2 top-1/2 w-3 h-3 -translate-x-1/2 -translate-y-1/2 animate-spin text-white" />
+                          ) : (
+                            <span
+                              className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform duration-300 shadow-sm ${selectedTenantCloudinaryUploadEnabled ? 'translate-x-6' : 'translate-x-1'}`}
                             />
                           )}
                         </button>

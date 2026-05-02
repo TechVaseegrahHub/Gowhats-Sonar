@@ -1,73 +1,347 @@
-"use client";
-
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect } from "react";
 import { publicApi } from "../utils/axios";
 import {
-  MessageSquare,
-  Zap,
-  CheckCircle,
-  AlertCircle,
-  Smile,
-  Send,
-  ExternalLink,
-  Save,
+  MessageSquare, Zap, CheckCircle, AlertCircle,
+  Save, ExternalLink, Plus, Trash2, List, LayoutGrid,
+  Info, Globe, ShoppingBag, Users, Lightbulb
 } from "lucide-react";
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const WORKFLOW_TYPES = [
+  "Visit Website",
+  "Shop Our Collection",
+  "Talk with Our Team",
+  "Product Suggestions",
+];
+
+const WORKFLOW_ICONS = {
+  "Visit Website": Globe,
+  "Shop Our Collection": ShoppingBag,
+  "Talk with Our Team": Users,
+  "Product Suggestions": Lightbulb,
+};
+
+const WORKFLOW_COLORS = {
+  "Visit Website": "bg-blue-50 border-blue-200 text-blue-700",
+  "Shop Our Collection": "bg-purple-50 border-purple-200 text-purple-700",
+  "Talk with Our Team": "bg-orange-50 border-orange-200 text-orange-700",
+  "Product Suggestions": "bg-emerald-50 border-emerald-200 text-emerald-700",
+};
+
+const DEFAULT_BUTTON_TEXTS = {
+  "Visit Website": "Visit Website",
+  "Shop Our Collection": "Shop Collection",
+  "Talk with Our Team": "Talk with Team",
+  "Product Suggestions": "Product Help",
+};
+
+const COMMON_EMOJIS = ["😊","👍","🙏","❤️","🌿","✨","🎉","🌟","👋","🔥","💯","🤔","👏","🙌","😍","💚"];
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+const getTenantId = () =>
+  localStorage.getItem("tenant_id") ||
+  localStorage.getItem("tenantId") ||
+  localStorage.getItem("x-tenant-id");
+
+const getToken = () => localStorage.getItem("token");
+
+// ─── Sub-components ───────────────────────────────────────────────────────────
+
+function StatusToast({ message, type }) {
+  if (!message) return null;
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className={`fixed bottom-5 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 px-4 py-3 rounded-xl shadow-xl border w-max max-w-sm text-sm font-medium transition-all
+        ${type === "error"
+          ? "bg-red-50 text-red-700 border-red-200"
+          : "bg-emerald-50 text-emerald-800 border-emerald-200"}`}
+    >
+      {type === "error"
+        ? <AlertCircle className="w-4 h-4 flex-shrink-0" />
+        : <CheckCircle className="w-4 h-4 flex-shrink-0" />}
+      <span className="break-words">{message}</span>
+    </div>
+  );
+}
+
+function ModeToggle({ mode, onChange, buttonCount }) {
+  // Button mode: max 3 | List mode: max 4
+  return (
+    <div className="flex gap-2 p-1 bg-gray-100 rounded-xl w-fit">
+      <button
+        onClick={() => onChange("Button")}
+        className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+          mode === "Button"
+            ? "bg-white text-emerald-700 shadow-sm"
+            : "text-gray-500 hover:text-gray-700"
+        }`}
+      >
+        <LayoutGrid className="w-3.5 h-3.5" />
+        Button
+        <span className="text-[10px] font-normal opacity-70">max 3</span>
+      </button>
+      <button
+        onClick={() => onChange("List")}
+        className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+          mode === "List"
+            ? "bg-white text-emerald-700 shadow-sm"
+            : "text-gray-500 hover:text-gray-700"
+        }`}
+      >
+        <List className="w-3.5 h-3.5" />
+        List
+        <span className="text-[10px] font-normal opacity-70">max 4</span>
+      </button>
+    </div>
+  );
+}
+
+function WorkflowCard({ wf, index, onUpdate, onRemove, canRemove, mode }) {
+  const Icon = WORKFLOW_ICONS[wf.workflow] || Globe;
+  const colorClass = WORKFLOW_COLORS[wf.workflow] || "bg-gray-50 border-gray-200 text-gray-700";
+  const charCount = wf.buttonText?.length || 0;
+  const isOverLimit = charCount > 20;
+  const isNearLimit = charCount >= 17 && charCount <= 20;
+  const maxAllowed = mode === "Button" ? 3 : 4;
+
+  return (
+    <div className={`rounded-xl border-2 p-3 transition-all ${isOverLimit ? "border-red-300 bg-red-50" : "border-gray-100 bg-white"}`}>
+      {/* Header row */}
+      <div className="flex items-center justify-between mb-2.5">
+        <div className={`flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-semibold border ${colorClass}`}>
+          <Icon className="w-3 h-3" />
+          {wf.workflow}
+        </div>
+        {canRemove && (
+          <button
+            onClick={() => onRemove(wf.id)}
+            className="p-1 rounded-lg text-gray-400 hover:text-red-500 hover:bg-red-50 transition-colors"
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+          </button>
+        )}
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+        {/* Button Text */}
+        <div>
+          <label className="block text-[11px] font-semibold text-gray-600 mb-1">
+            Button Label
+          </label>
+          <input
+            value={wf.buttonText}
+            onChange={(e) => onUpdate(wf.id, "buttonText", e.target.value)}
+            maxLength={25}
+            placeholder="Max 20 chars"
+            className={`w-full px-2.5 py-1.5 rounded-lg border text-xs transition-colors ${
+              isOverLimit
+                ? "border-red-400 bg-red-50 text-red-700 focus:ring-red-200"
+                : isNearLimit
+                ? "border-orange-300 bg-orange-50"
+                : "border-gray-200 bg-gray-50 focus:border-emerald-400 focus:bg-white"
+            } outline-none focus:ring-2 focus:ring-emerald-100`}
+          />
+          <div className={`text-[10px] mt-0.5 font-medium ${isOverLimit ? "text-red-600" : isNearLimit ? "text-orange-500" : "text-gray-400"}`}>
+            {charCount}/20
+            {isOverLimit && ` — shorten by ${charCount - 20}`}
+          </div>
+        </div>
+
+        {/* Action Type */}
+        <div>
+          <label className="block text-[11px] font-semibold text-gray-600 mb-1">
+            Action
+          </label>
+          <select
+            value={wf.workflow}
+            onChange={(e) => onUpdate(wf.id, "workflow", e.target.value)}
+            className="w-full px-2.5 py-1.5 rounded-lg border border-gray-200 bg-gray-50 text-xs outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100"
+          >
+            {WORKFLOW_TYPES.map((t) => (
+              <option key={t} value={t}>{t}</option>
+            ))}
+          </select>
+        </div>
+      </div>
+
+      {/* URL field for Visit Website */}
+      {wf.workflow === "Visit Website" && (
+        <div className="mt-2">
+          <label className="block text-[11px] font-semibold text-gray-600 mb-1">
+            Website URL <span className="text-red-400">*</span>
+          </label>
+          <div className="relative">
+            <ExternalLink className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3 h-3 text-gray-400" />
+            <input
+              type="url"
+              value={wf.url || ""}
+              onChange={(e) => onUpdate(wf.id, "url", e.target.value)}
+              placeholder="https://yourwebsite.com"
+              className="w-full pl-7 pr-2.5 py-1.5 rounded-lg border border-gray-200 bg-gray-50 text-xs outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100"
+            />
+          </div>
+          {wf.url && !wf.url.startsWith("http") && (
+            <p className="text-[10px] text-orange-500 mt-0.5">URL should start with https://</p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Phone Preview ────────────────────────────────────────────────────────────
+
+function PhonePreview({ headerText, messageBody, workflows, interactiveType, welcomeMessageType }) {
+  return (
+    <div className="flex justify-center">
+      <div
+        className="relative flex flex-col rounded-[2rem] overflow-hidden border-[6px] border-gray-800 bg-gray-800 shadow-2xl"
+        style={{ width: 256, height: 520 }}
+      >
+        {/* Notch */}
+        <div className="absolute top-0 left-1/2 -translate-x-1/2 w-20 h-5 bg-gray-800 rounded-b-xl z-10" />
+
+        {/* Screen */}
+        <div className="flex flex-col flex-1 overflow-hidden rounded-[1.4rem]">
+          {/* WhatsApp bar */}
+          <div className="bg-[#075e54] text-white px-3 pt-6 pb-2 flex items-center gap-2 flex-shrink-0">
+            <svg className="w-3 h-3 flex-shrink-0" viewBox="0 0 24 24" fill="none">
+              <path d="M10 19l-7-7 7-7" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"/>
+            </svg>
+            <div className="w-6 h-6 rounded-full bg-emerald-400 flex items-center justify-center flex-shrink-0">
+              <span className="text-[8px] font-bold text-white">W</span>
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="text-[10px] font-semibold truncate leading-none">WhatsApp Chat</div>
+              <div className="text-[8px] text-emerald-200 leading-none mt-0.5">online</div>
+            </div>
+          </div>
+
+          {/* Chat area */}
+          <div
+            className="flex-1 overflow-y-auto px-2 py-3"
+            style={{ backgroundColor: "#e5ddd5" }}
+          >
+            <div className="flex justify-start">
+              <div className="bg-white rounded-lg rounded-tl-none shadow-sm px-2.5 py-2 max-w-[95%]">
+                {headerText && (
+                  <div className="text-[10px] font-bold text-gray-900 mb-1 leading-tight">{headerText}</div>
+                )}
+                <div className="text-[9px] text-gray-700 leading-relaxed whitespace-pre-wrap break-words">
+                  {messageBody || "Your message will appear here..."}
+                </div>
+                <div className="text-right text-[8px] text-gray-400 mt-1">Just now ✓✓</div>
+              </div>
+            </div>
+
+            {/* Button mode preview */}
+            {welcomeMessageType === "Interactive" && interactiveType === "Button" && workflows.length > 0 && (
+              <div className="mt-1.5 space-y-1 max-w-[95%]">
+                {workflows.slice(0, 3).map((w) => {
+                  const over = w.buttonText?.length > 20;
+                  return (
+                    <div
+                      key={w.id}
+                      className={`flex items-center justify-center gap-1 w-full py-1.5 border rounded-lg shadow-sm ${
+                        over ? "bg-red-50 border-red-300" : "bg-white border-gray-200"
+                      }`}
+                    >
+                      <span className={`text-[9px] font-semibold px-1 ${over ? "text-red-600" : "text-[#075e54]"}`}>
+                        {over ? `⚠ ${w.buttonText.substring(0, 17)}...` : w.buttonText}
+                      </span>
+                      {w.workflow === "Visit Website" && w.url && (
+                        <ExternalLink className="w-2 h-2 text-[#075e54] flex-shrink-0" />
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* List mode preview */}
+            {welcomeMessageType === "Interactive" && interactiveType === "List" && workflows.length > 0 && (
+              <div className="mt-1.5 max-w-[95%]">
+                <div className="w-full py-1.5 border border-gray-200 rounded-lg bg-white shadow-sm flex items-center justify-center gap-1">
+                  <List className="w-2.5 h-2.5 text-[#075e54]" />
+                  <span className="text-[9px] font-semibold text-[#075e54]">View options</span>
+                </div>
+                <div className="mt-1 text-[8px] text-gray-500 text-center">
+                  {workflows.length} option{workflows.length !== 1 ? "s" : ""} in list
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Input bar */}
+          <div className="bg-[#f0f0f0] px-2 py-1.5 flex items-center gap-1.5 flex-shrink-0">
+            <div className="w-4 h-4 rounded-full bg-gray-400 flex-shrink-0" />
+            <div className="flex-1 bg-white rounded-full px-2 py-1 text-[8px] text-gray-400">Type a message</div>
+            <div className="bg-[#075e54] rounded-full p-1.5 flex-shrink-0">
+              <div className="w-2.5 h-2.5 rounded-full bg-white opacity-80" />
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Main Component ───────────────────────────────────────────────────────────
 
 export default function BotConfiguration() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [isBotActive, setIsBotActive] = useState(false);
   const [welcomeMessageType, setWelcomeMessageType] = useState("Interactive");
+  const [interactiveType, setInteractiveType] = useState("Button");
   const [headerText, setHeaderText] = useState("Welcome to Vaseegrah Veda!");
   const [messageBody, setMessageBody] = useState(
-    "Ready to embrace the freshness of nature? Share us your Hair/Skin concerns, Our team will guide you to the perfect herbal solution"
+    "Ready to embrace the freshness of nature? Share us your Hair/Skin concerns, Our team will guide you to the perfect herbal solution tailored for you! 🌿✨"
   );
   const [triggerWordsInput, setTriggerWordsInput] = useState("hi, hello, hey, start, help");
   const [workflows, setWorkflows] = useState([
-    { id: 1, workflow: "Visit Website", buttonText: "Visit Website", url: "https://techvaseegrah.com" },
-    { id: 2, workflow: "Shop Our Collection", buttonText: "Shop Collection" },
-    { id: 3, workflow: "Talk with Our Team", buttonText: "Talk with Team" },
-    { id: 4, workflow: "Product Suggestions", buttonText: "Product Help" },
+    { id: 1, workflow: "Visit Website", buttonText: "Visit Website", url: "" },
+    { id: 2, workflow: "Shop Our Collection", buttonText: "Shop Collection", url: "" },
+    { id: 3, workflow: "Talk with Our Team", buttonText: "Talk with Team", url: "" },
   ]);
   const [workflowMessages, setWorkflowMessages] = useState([
-    { workflow: "Visit Website", message: "Here is our website: https://techvaseegrah.com Visit us to browse our products! 🙏", isCustomized: false },
-    { workflow: "Shop Our Collection", message: "To shop our products, click the 'WhatsApp Shop' button above.", isCustomized: false },
-    { workflow: "Talk with Our Team", message: "Hi 👋 Our customer support executive will get in touch with you soon.", isCustomized: false },
-    { workflow: "Product Suggestions", message: "🤖 AI Assistant activated! Tell me what you're looking for.", isCustomized: false },
+    { workflow: "Visit Website", message: "Click the link below to visit our website! 🙏", url: null, isCustomized: false },
+    { workflow: "Shop Our Collection", message: "To shop our products, click the 'WhatsApp Shop' button above.", url: null, isCustomized: false },
+    { workflow: "Talk with Our Team", message: "Hi 👋 Our customer support executive will get in touch with you soon. We appreciate your patience! ❤️", url: null, isCustomized: false },
+    { workflow: "Product Suggestions", message: "🤖 AI Assistant activated! I'm here to help you find the perfect products.", url: null, isCustomized: false },
   ]);
+  const [buttonErrors, setButtonErrors] = useState({});
+  const [urlErrors, setUrlErrors] = useState({});
+  const [showEmoji, setShowEmoji] = useState(false);
   const [statusMessage, setStatusMessage] = useState("");
   const [statusType, setStatusType] = useState("success");
-  const [showEmojiPicker, setShowEmojiPicker] = useState(false);
+  const [togglingBot, setTogglingBot] = useState(false);
 
-  // ✅ Track button text errors
-  const [buttonErrors, setButtonErrors] = useState({});
+  // Limits per mode
+  const maxWorkflows = interactiveType === "Button" ? 3 : 4;
 
-  const commonEmojis = ["😊","👍","🙏","❤️","🌿","✨","🎉","🌟","👋","🔥","💯","🤔","👏","🙌","😍","🎊"];
+  // ── Load config ────────────────────────────────────────────────────────────
 
   useEffect(() => {
-    fetchBotConfiguration();
+    fetchConfig();
   }, []);
 
-  const showStatus = (msg, type = "success", ttl = 3000) => {
+  const showStatus = (msg, type = "success", ttl = 4000) => {
     setStatusMessage(msg);
     setStatusType(type);
     if (ttl > 0) setTimeout(() => setStatusMessage(""), ttl);
   };
 
-  const getTenantIdFromLocal = () => {
-    return (
-      localStorage.getItem("tenant_id") ||
-      localStorage.getItem("tenantId") ||
-      localStorage.getItem("x-tenant-id")
-    );
-  };
-
-  const fetchBotConfiguration = async () => {
+  const fetchConfig = async () => {
     try {
       setLoading(true);
-      const token = localStorage.getItem("token");
-      const tenantId = getTenantIdFromLocal();
-      if (!tenantId) throw new Error("Tenant ID not found in localStorage");
+      const token = getToken();
+      const tenantId = getTenantId();
+      if (!tenantId) throw new Error("Your session has expired. Please log in again.");
 
       const res = await publicApi.get("/api/welcome-message", {
         headers: { Authorization: `Bearer ${token}`, "x-tenant-id": tenantId },
@@ -76,68 +350,101 @@ export default function BotConfiguration() {
       const cfg = res.data || {};
       setIsBotActive(cfg.isActive || false);
       setWelcomeMessageType(cfg.welcomeMessageType || "Interactive");
-      setHeaderText(cfg.headerText ?? "");
+      setInteractiveType(cfg.interactiveType || "Button");
+      setHeaderText(cfg.headerText ?? "Welcome to Vaseegrah Veda!");
       setMessageBody(cfg.messageBody ?? "");
 
-      if (cfg.triggerWords && Array.isArray(cfg.triggerWords)) {
+      if (Array.isArray(cfg.triggerWords) && cfg.triggerWords.length) {
         setTriggerWordsInput(cfg.triggerWords.join(", "));
       }
 
-      if (cfg.workflows && Array.isArray(cfg.workflows) && cfg.workflows.length) {
-        setWorkflows(cfg.workflows.map((w, i) => ({
-          id: w.id ?? Date.now() + i,
-          workflow: w.workflow,
-          buttonText: w.buttonText ?? w.workflow,
-          url: w.url ?? "",
-        })));
+      if (Array.isArray(cfg.workflows) && cfg.workflows.length) {
+        setWorkflows(
+          cfg.workflows.map((w, i) => ({
+            id: w.id ?? Date.now() + i,
+            workflow: w.workflow,
+            buttonText: w.buttonText ?? w.workflow,
+            url: w.url ?? "",
+          }))
+        );
       }
 
-      if (cfg.workflowMessages && Array.isArray(cfg.workflowMessages) && cfg.workflowMessages.length) {
+      if (Array.isArray(cfg.workflowMessages) && cfg.workflowMessages.length) {
         setWorkflowMessages(cfg.workflowMessages);
       }
     } catch (err) {
-      console.error("fetchBotConfiguration error:", err);
-      showStatus("Error fetching configuration", "error");
+      const msg = err?.response?.data?.message || err.message;
+      showStatus(`Could not load your settings. ${msg}`, "error", 6000);
     } finally {
       setLoading(false);
     }
   };
 
-  // ✅ FIXED: Direct async save function (no debounce, no useCallback issues)
-  const saveConfig = async () => {
-    // Validate button lengths before saving
-    const errors = {};
+  // ── Validation ─────────────────────────────────────────────────────────────
+
+  const validate = () => {
+    const bErrors = {};
+    const uErrors = {};
+
     workflows.forEach((wf) => {
-      if (wf.buttonText.length > 20) {
-        errors[wf.id] = `Too long (${wf.buttonText.length}/20 chars)`;
+      if (!wf.buttonText?.trim()) {
+        bErrors[wf.id] = "Button label cannot be empty";
+      } else if (wf.buttonText.length > 20) {
+        bErrors[wf.id] = `Too long — max 20 characters (currently ${wf.buttonText.length})`;
+      }
+      if (wf.workflow === "Visit Website") {
+        if (!wf.url?.trim()) {
+          uErrors[wf.id] = "Please add a website URL for this button";
+        } else if (!wf.url.startsWith("http://") && !wf.url.startsWith("https://")) {
+          uErrors[wf.id] = "URL must start with https://";
+        }
       }
     });
 
-    if (Object.keys(errors).length > 0) {
-      setButtonErrors(errors);
-      showStatus("Fix button text lengths before saving (max 20 chars)", "error", 4000);
+    setButtonErrors(bErrors);
+    setUrlErrors(uErrors);
+    return Object.keys(bErrors).length === 0 && Object.keys(uErrors).length === 0;
+  };
+
+  const hasErrors = Object.keys(buttonErrors).length > 0 || Object.keys(urlErrors).length > 0;
+
+  // ── Save ───────────────────────────────────────────────────────────────────
+
+  const saveConfig = async () => {
+    if (!validate()) {
+      showStatus("Please fix the highlighted errors before saving.", "error");
       return;
     }
 
-    setButtonErrors({});
-
     try {
       setSaving(true);
-      const token = localStorage.getItem("token");
-      const tenantId = getTenantIdFromLocal();
-      if (!token || !tenantId) throw new Error("Missing token or tenant ID");
+      const token = getToken();
+      const tenantId = getTenantId();
+      if (!token || !tenantId) {
+        showStatus("Your session has expired. Please refresh the page and log in again.", "error", 7000);
+        return;
+      }
+
+      // Sync Visit Website URL from workflow into workflowMessages
+      const visitWebsiteWf = workflows.find((w) => w.workflow === "Visit Website");
+      const syncedMessages = workflowMessages.map((msg) => {
+        if (msg.workflow === "Visit Website" && visitWebsiteWf) {
+          return { ...msg, url: visitWebsiteWf.url || null };
+        }
+        return msg;
+      });
 
       const payload = {
         welcomeMessageType,
-        interactiveType: workflows.length > 3 ? "List" : "Button",
+        interactiveType,
         headerText,
         messageBody,
-        // ✅ Enforce 20 char max on save
-        workflows: workflows.map(wf => ({
-          ...wf,
-          buttonText: wf.buttonText.substring(0, 20)
+        workflows: workflows.map((wf) => ({
+          workflow: wf.workflow,
+          buttonText: wf.buttonText.substring(0, 20),
+          url: wf.url || null,
         })),
-        workflowMessages,
+        workflowMessages: syncedMessages,
         isActive: isBotActive,
         triggerWords: triggerWordsInput
           .split(",")
@@ -149,21 +456,42 @@ export default function BotConfiguration() {
         headers: { Authorization: `Bearer ${token}`, "x-tenant-id": tenantId },
       });
 
-      showStatus("✅ Welcome message saved successfully!");
+      showStatus("✅ Configuration saved successfully!");
     } catch (err) {
-      console.error("save error:", err);
-      showStatus("Error saving configuration", "error");
+      const detail =
+        err?.response?.data?.message ||
+        err?.response?.data?.error ||
+        err.message;
+
+      // User-friendly error messages
+      if (err?.response?.status === 401) {
+        showStatus("Your session has expired. Please log in again.", "error", 7000);
+     } else if (err?.response?.status === 400) {
+	  const friendly = detail
+	    ?.replace(/Invalid URL in workflowMessages for Visit Website\. Must be http or https\./i,
+	      "Please add a valid website URL (e.g. https://yoursite.com) for the Visit Website button.")
+	    ?.replace(/Invalid URL.*Must be http or https/i,
+	      "Please add a valid website URL starting with https:// for the Visit Website button.");
+	  showStatus(friendly || `Validation error: ${detail}`, "error", 7000);
+
+      } else if (err?.response?.status >= 500) {
+        showStatus("Server error. Please try again in a moment.", "error", 7000);
+      } else {
+        showStatus(`Could not save: ${detail}`, "error", 7000);
+      }
     } finally {
       setSaving(false);
     }
   };
 
-  const toggleBotStatus = async () => {
+  // ── Toggle bot ─────────────────────────────────────────────────────────────
+
+  const toggleBot = async () => {
     try {
+      setTogglingBot(true);
       const newStatus = !isBotActive;
-      const token = localStorage.getItem("token");
-      const tenantId = getTenantIdFromLocal();
-      if (!token || !tenantId) throw new Error("Missing token or tenant ID");
+      const token = getToken();
+      const tenantId = getTenantId();
 
       await publicApi.post(
         "/api/welcome-message/bot-status",
@@ -172,65 +500,77 @@ export default function BotConfiguration() {
       );
 
       setIsBotActive(newStatus);
-      showStatus(`Bot is now ${newStatus ? "active ✅" : "inactive"}`);
+      showStatus(
+        newStatus
+          ? "✅ Welcome bot is now active — it will greet your customers!"
+          : "Bot paused — no welcome messages will be sent.",
+        "success"
+      );
     } catch (err) {
-      console.error("toggleBotStatus error:", err);
-      showStatus("Error updating bot status", "error");
+      if (err?.response?.status === 401) {
+        showStatus("Session expired. Please log in again.", "error");
+      } else {
+        showStatus("Could not update bot status. Please try again.", "error");
+      }
+    } finally {
+      setTogglingBot(false);
     }
   };
+
+  // ── Interactive type change ────────────────────────────────────────────────
+
+  const handleInteractiveTypeChange = (newType) => {
+    const max = newType === "Button" ? 3 : 4;
+    setInteractiveType(newType);
+    // Trim workflows if over limit
+    if (workflows.length > max) {
+      setWorkflows((prev) => prev.slice(0, max));
+      showStatus(`Switched to ${newType} mode — trimmed to ${max} actions.`, "success");
+    }
+  };
+
+  // ── Workflow management ────────────────────────────────────────────────────
 
   const addWorkflow = (type) => {
-    const nextId = Date.now();
-    // ✅ Default button text already within 20 chars
-    const defaultButtonText = {
-      "Visit Website": "Visit Website",
-      "Shop Our Collection": "Shop Collection",
-      "Talk with Our Team": "Talk with Team",
-      "Product Suggestions": "Product Help",
-    };
-    const wf = {
-      id: nextId,
+    if (workflows.length >= maxWorkflows) return;
+    const newWf = {
+      id: Date.now(),
       workflow: type,
-      buttonText: defaultButtonText[type] || type.substring(0, 20),
-      url: type === "Visit Website" ? "https://" : "",
+      buttonText: DEFAULT_BUTTON_TEXTS[type] || type.substring(0, 20),
+      url: type === "Visit Website" ? "" : "",
     };
-    setWorkflows((p) => [...p, wf]);
+    setWorkflows((prev) => [...prev, newWf]);
   };
 
-  const updateWorkflowField = (id, field, value) => {
+  const updateWorkflow = (id, field, value) => {
     if (field === "buttonText") {
-      // ✅ Clear error when user edits
       if (value.length <= 20) {
-        setButtonErrors((prev) => {
-          const copy = { ...prev };
-          delete copy[id];
-          return copy;
-        });
+        setButtonErrors((prev) => { const c = { ...prev }; delete c[id]; return c; });
       } else {
-        setButtonErrors((prev) => ({
-          ...prev,
-          [id]: `Too long (${value.length}/20 chars)`,
-        }));
+        setButtonErrors((prev) => ({ ...prev, [id]: `Too long — max 20 characters (currently ${value.length})` }));
       }
     }
-    setWorkflows((prev) =>
-      prev.map((w) => (w.id === id ? { ...w, [field]: value } : w))
-    );
+    if (field === "url") {
+      if (value && (value.startsWith("http://") || value.startsWith("https://"))) {
+        setUrlErrors((prev) => { const c = { ...prev }; delete c[id]; return c; });
+      }
+    }
+    setWorkflows((prev) => prev.map((w) => (w.id === id ? { ...w, [field]: value } : w)));
   };
 
   const removeWorkflow = (id) => {
-    if (workflows.length <= 1) return;
-    const removed = workflows.find((w) => w.id === id);
-    setWorkflows((p) => p.filter((w) => w.id !== id));
-    if (removed) {
-      setWorkflowMessages((p) => p.filter((m) => m.workflow !== removed.workflow));
+    if (workflows.length <= 1) {
+      showStatus("You need at least one action button.", "error");
+      return;
     }
-    setButtonErrors((prev) => {
-      const copy = { ...prev };
-      delete copy[id];
-      return copy;
-    });
+    const removed = workflows.find((w) => w.id === id);
+    setWorkflows((prev) => prev.filter((w) => w.id !== id));
+    if (removed) setWorkflowMessages((prev) => prev.filter((m) => m.workflow !== removed.workflow));
+    setButtonErrors((prev) => { const c = { ...prev }; delete c[id]; return c; });
+    setUrlErrors((prev) => { const c = { ...prev }; delete c[id]; return c; });
   };
+
+  // ── Workflow messages ──────────────────────────────────────────────────────
 
   const updateWorkflowMessage = (workflow, message) => {
     setWorkflowMessages((prev) => {
@@ -247,471 +587,397 @@ export default function BotConfiguration() {
   const getWorkflowMessage = (workflow) =>
     workflowMessages.find((m) => m.workflow === workflow)?.message ?? "";
 
+  // ── Emoji ──────────────────────────────────────────────────────────────────
+
   const addEmoji = (emoji) => {
     setMessageBody((s) => (s.endsWith(" ") || s === "" ? s + emoji : s + " " + emoji));
-    setShowEmojiPicker(false);
+    setShowEmoji(false);
   };
 
-  const availableWorkflowTypes = [
-    "Visit Website",
-    "Shop Our Collection",
-    "Talk with Our Team",
-    "Product Suggestions",
-  ];
+  // ── Available types to add ─────────────────────────────────────────────────
 
-  // Check if any button text exceeds limit
-  const hasButtonErrors = Object.keys(buttonErrors).length > 0;
+  const usedTypes = workflows.map((w) => w.workflow);
+  const availableToAdd = WORKFLOW_TYPES.filter((t) => !usedTypes.includes(t));
+
+  // ─────────────────────────────────────────────────────────────────────────
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-screen bg-gradient-to-br from-green-50 via-white to-emerald-50">
+      <div className="flex items-center justify-center min-h-screen bg-gradient-to-br from-emerald-50 via-white to-green-50">
         <div className="text-center">
-          <div className="relative">
-            <div className="animate-spin h-16 w-16 rounded-full border-4 border-green-200 border-t-emerald-400 mx-auto" />
+          <div className="relative w-16 h-16 mx-auto mb-4">
+            <div className="animate-spin w-16 h-16 rounded-full border-4 border-emerald-100 border-t-emerald-500" />
             <div className="absolute inset-0 flex items-center justify-center">
               <MessageSquare className="w-6 h-6 text-emerald-600" />
             </div>
           </div>
-          <p className="mt-4 text-gray-700 font-medium">Loading configuration...</p>
+          <p className="text-gray-600 font-medium text-sm">Loading your welcome message settings...</p>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-white overflow-x-hidden">
-      {/* Status notification */}
-      {statusMessage && (
-        <div
-          role="status"
-          aria-live="polite"
-          className={`fixed bottom-4 right-4 z-50 px-3 py-2 rounded-lg shadow-lg max-w-[320px] ${
-            statusType === "error"
-              ? "bg-red-50 text-red-700 border border-red-200"
-              : "bg-emerald-50 text-emerald-800 border border-emerald-200"
-          }`}
-        >
-          <div className="flex items-center gap-2">
-            {statusType === "error" ? (
-              <AlertCircle className="w-4 h-4 flex-shrink-0" />
-            ) : (
-              <CheckCircle className="w-4 h-4 flex-shrink-0" />
-            )}
-            <span className="font-medium text-sm break-words">{statusMessage}</span>
-          </div>
-        </div>
-      )}
+    <div className="min-h-screen bg-gray-50/50">
+      <StatusToast message={statusMessage} type={statusType} />
 
-      <div className="w-full max-w-[1500px] mx-auto px-3 sm:px-6 py-4 sm:py-6">
-        {/* Header */}
-        <div className="flex flex-wrap items-center justify-between gap-3 mb-4 sm:mb-6">
-          <div className="flex items-center gap-3 min-w-0">
-            <div className="bg-emerald-600 p-2 rounded-lg flex-shrink-0">
-              <MessageSquare className="w-5 h-5 sm:w-6 sm:h-6 text-white" />
+      <div className="max-w-[1400px] mx-auto px-3 sm:px-6 py-5">
+
+        {/* ── Header ── */}
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-5">
+          <div className="flex items-center gap-3">
+            <div className="bg-emerald-600 p-2.5 rounded-xl shadow-sm">
+              <MessageSquare className="w-5 h-5 text-white" />
             </div>
-            <div className="min-w-0">
-              <h1 className="text-lg sm:text-2xl font-semibold text-gray-900 truncate">
-                Welcome Message Hub
-              </h1>
-              <p className="text-xs sm:text-sm text-gray-500 truncate">
-                Configure your welcome message and preview it in real time
-              </p>
+            <div>
+              <h1 className="text-xl font-bold text-gray-900">Welcome Message Hub</h1>
+              <p className="text-xs text-gray-500">Configure what customers see when they first message you</p>
             </div>
           </div>
 
-          {/* Toggle Switch */}
-          <div className="flex items-center gap-2 sm:gap-3 bg-white px-3 py-2 rounded-lg border shadow-sm text-sm ml-auto">
-            <Zap className={`w-4 h-4 sm:w-5 sm:h-5 ${isBotActive ? "text-emerald-600" : "text-gray-400"}`} />
-            <button
-              onClick={toggleBotStatus}
-              aria-pressed={isBotActive}
-              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-all duration-200 ${
-                isBotActive ? "bg-emerald-600" : "bg-gray-300"
+          {/* Bot toggle */}
+          <button
+            onClick={toggleBot}
+            disabled={togglingBot}
+            className={`flex items-center gap-2.5 px-4 py-2 rounded-xl border shadow-sm text-sm font-medium transition-all ${
+              isBotActive
+                ? "bg-emerald-50 border-emerald-200 text-emerald-700 hover:bg-emerald-100"
+                : "bg-white border-gray-200 text-gray-600 hover:bg-gray-50"
+            } disabled:opacity-60`}
+          >
+            <Zap className={`w-4 h-4 ${isBotActive ? "text-emerald-600" : "text-gray-400"}`} />
+            <div
+              className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                isBotActive ? "bg-emerald-500" : "bg-gray-300"
               }`}
             >
               <span
-                className={`inline-block h-4 w-4 rounded-full bg-white transform transition ${
-                  isBotActive ? "translate-x-6" : "translate-x-1"
+                className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform ${
+                  isBotActive ? "translate-x-4" : "translate-x-0.5"
                 }`}
               />
-            </button>
-            <span className={`font-medium whitespace-nowrap ${isBotActive ? "text-emerald-600" : "text-gray-600"}`}>
-              {isBotActive ? "Active" : "Inactive"}
-            </span>
-          </div>
+            </div>
+            <span>{togglingBot ? "Updating..." : isBotActive ? "Active" : "Inactive"}</span>
+          </button>
         </div>
 
-        {/* Main Grid */}
-        <div className="grid grid-cols-1 lg:grid-cols-[1fr_300px] xl:grid-cols-[1fr_340px] gap-4 sm:gap-6 items-start">
+        {/* ── Main grid ── */}
+        <div className="grid grid-cols-1 lg:grid-cols-[1fr_280px] xl:grid-cols-[1fr_300px] gap-5 items-start">
 
-          {/* ── LEFT: Config Panel ── */}
-          <div className="bg-gray-50 rounded-xl border border-gray-100 p-4 sm:p-5 overflow-auto max-h-[calc(100vh-140px)]">
-            <div className="space-y-4 text-sm">
+          {/* LEFT: Config */}
+          <div className="space-y-4">
 
-              {/* Welcome Message Type */}
-              <div>
-                <label className="block text-xs font-semibold text-gray-700 mb-1">Welcome message type</label>
-                <select
-                  value={welcomeMessageType}
-                  onChange={(e) => setWelcomeMessageType(e.target.value)}
-                  className="w-full p-2 rounded-lg border text-sm bg-white"
-                >
-                  <option>Interactive</option>
-                  <option>Simple Text</option>
-                </select>
-              </div>
+            {/* Message Settings card */}
+            <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5">
+              <h2 className="text-sm font-bold text-gray-800 mb-4">Message Settings</h2>
 
-              {/* Trigger Words */}
-              <div>
-                <label className="block text-xs font-semibold text-gray-700 mb-1">Trigger Words</label>
-                <textarea
-                  value={triggerWordsInput}
-                  onChange={(e) => setTriggerWordsInput(e.target.value)}
-                  rows={2}
-                  className="w-full p-2 rounded-lg border text-sm bg-white resize-none"
-                  placeholder="hi, hello, hey"
-                />
-                <p className="text-xs text-gray-500 mt-1">Separate words with commas</p>
-              </div>
-
-              {/* Header Text */}
-              <div>
-                <label className="block text-xs font-semibold text-gray-700 mb-1">Header Text</label>
-                <input
-                  value={headerText}
-                  onChange={(e) => setHeaderText(e.target.value)}
-                  className="w-full p-2 rounded-lg border text-sm bg-white"
-                  maxLength={60}
-                />
-                <p className={`text-xs mt-1 ${headerText.length >= 55 ? "text-orange-500" : "text-gray-500"}`}>
-                  {headerText.length} / 60
-                </p>
-              </div>
-
-              {/* Message Body */}
-              <div>
-                <label className="block text-xs font-semibold text-gray-700 mb-1">Message Body</label>
-                <textarea
-                  value={messageBody}
-                  onChange={(e) => setMessageBody(e.target.value)}
-                  rows={4}
-                  className="w-full p-2 rounded-lg border text-sm bg-white resize-none"
-                  maxLength={1024}
-                />
-                <div className="flex items-center justify-between mt-1 text-xs text-gray-500">
-                  <span className={messageBody.length >= 950 ? "text-orange-500" : ""}>
-                    {messageBody.length} / 1024
-                  </span>
-                  <button
-                    onClick={() => setShowEmojiPicker((s) => !s)}
-                    className="px-2 py-1 bg-white border rounded text-xs hover:bg-gray-50"
-                  >
-                    Add Emoji
-                  </button>
-                </div>
-                {showEmojiPicker && (
-                  <div className="mt-2 grid grid-cols-8 gap-1 p-2 bg-white border rounded-lg">
-                    {commonEmojis.map((em) => (
-                      <button
-                        key={em}
-                        onClick={() => addEmoji(em)}
-                        className="p-1.5 rounded hover:bg-gray-100 text-base transition-colors"
-                      >
-                        {em}
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-
-              {/* Interactive Actions */}
-              {welcomeMessageType === "Interactive" && (
+              <div className="space-y-4 text-sm">
+                {/* Message Type */}
                 <div>
-                  <div className="flex items-center justify-between gap-2 mb-3">
-                    <h3 className="text-sm font-semibold text-gray-700">Interactive Actions</h3>
-                    <select
-                      onChange={(e) => { const val = e.target.value; if (val) addWorkflow(val); e.target.value = ""; }}
-                      defaultValue=""
-                      className="text-xs p-1.5 border rounded bg-white"
+                  <label className="block text-xs font-semibold text-gray-600 mb-1.5">Message Type</label>
+                  <select
+                    value={welcomeMessageType}
+                    onChange={(e) => setWelcomeMessageType(e.target.value)}
+                    className="w-full sm:w-64 px-3 py-2 rounded-xl border border-gray-200 text-sm bg-white outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100"
+                  >
+                    <option value="Interactive">Interactive (with buttons)</option>
+                    <option value="Simple Text">Simple Text (no buttons)</option>
+                  </select>
+                </div>
+
+                {/* Trigger Words */}
+                <div>
+                  <label className="block text-xs font-semibold text-gray-600 mb-1.5">
+                    Trigger Words
+                    <span className="ml-1.5 text-gray-400 font-normal">(comma separated)</span>
+                  </label>
+                  <textarea
+                    value={triggerWordsInput}
+                    onChange={(e) => setTriggerWordsInput(e.target.value)}
+                    rows={2}
+                    placeholder="hi, hello, hey, start, help"
+                    className="w-full px-3 py-2 rounded-xl border border-gray-200 text-sm bg-white resize-none outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100"
+                  />
+                  <p className="text-[11px] text-gray-400 mt-1">
+                    Your welcome message is sent when a customer types any of these words
+                  </p>
+                </div>
+
+                {/* Header Text */}
+                <div>
+                  <label className="block text-xs font-semibold text-gray-600 mb-1.5">Header Text</label>
+                  <input
+                    value={headerText}
+                    onChange={(e) => setHeaderText(e.target.value)}
+                    maxLength={60}
+                    className="w-full px-3 py-2 rounded-xl border border-gray-200 text-sm outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100"
+                  />
+                  <p className={`text-[11px] mt-1 ${headerText.length >= 55 ? "text-orange-500" : "text-gray-400"}`}>
+                    {headerText.length}/60 characters
+                  </p>
+                </div>
+
+                {/* Message Body */}
+                <div>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <label className="text-xs font-semibold text-gray-600">Message Body</label>
+                    <button
+                      onClick={() => setShowEmoji((s) => !s)}
+                      className="text-xs px-2 py-0.5 rounded-lg border border-gray-200 bg-gray-50 hover:bg-gray-100 text-gray-600 transition-colors"
                     >
-                      <option value="">Add action...</option>
-                      {availableWorkflowTypes
-                        .filter((t) => !workflows.some((w) => w.workflow === t))
-                        .map((t) => <option key={t} value={t}>{t}</option>)}
-                    </select>
+                      😊 Emoji
+                    </button>
+                  </div>
+                  <textarea
+                    value={messageBody}
+                    onChange={(e) => setMessageBody(e.target.value)}
+                    rows={4}
+                    maxLength={1024}
+                    className="w-full px-3 py-2 rounded-xl border border-gray-200 text-sm resize-none outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100"
+                  />
+                  <div className="flex items-center justify-between mt-1">
+                    <p className={`text-[11px] ${messageBody.length >= 950 ? "text-orange-500" : "text-gray-400"}`}>
+                      {messageBody.length}/1024 characters
+                    </p>
+                    {messageBody.includes("**") && (
+                      <p className="text-[11px] text-orange-500">
+                        ⚠ Use *single asterisk* for bold text in WhatsApp
+                      </p>
+                    )}
                   </div>
 
-                  {/* ✅ Warning banner if any button text is too long */}
-                  {hasButtonErrors && (
-                    <div className="mb-3 p-2.5 bg-red-50 border border-red-200 rounded-lg flex items-start gap-2">
-                      <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0 mt-0.5" />
-                      <div>
-                        <p className="text-xs font-semibold text-red-700">Button text too long!</p>
-                        <p className="text-xs text-red-600">WhatsApp allows max 20 characters per button. Please shorten the highlighted buttons.</p>
-                      </div>
+                  {showEmoji && (
+                    <div className="mt-2 grid grid-cols-8 gap-1 p-2.5 bg-gray-50 border border-gray-200 rounded-xl">
+                      {COMMON_EMOJIS.map((em) => (
+                        <button
+                          key={em}
+                          onClick={() => addEmoji(em)}
+                          className="p-1.5 rounded-lg hover:bg-white hover:shadow-sm text-base transition-all"
+                        >
+                          {em}
+                        </button>
+                      ))}
                     </div>
                   )}
-
-                  <div className="space-y-3">
-                    {workflows.map((wf) => {
-                      const hasError = !!buttonErrors[wf.id];
-                      const charCount = wf.buttonText.length;
-                      const isNearLimit = charCount >= 17 && charCount <= 20;
-                      const isOverLimit = charCount > 20;
-
-                      return (
-                        <div
-                          key={wf.id}
-                          className={`bg-white p-3 rounded-lg border space-y-2 ${hasError ? "border-red-400 bg-red-50" : ""}`}
-                        >
-                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                            <div>
-                              <label className="block text-xs text-gray-600 mb-1">
-                                Button Text
-                                {isOverLimit && (
-                                  <span className="ml-1 text-red-500 font-semibold">⚠ Too long!</span>
-                                )}
-                              </label>
-                              <input
-                                value={wf.buttonText}
-                                onChange={(e) => updateWorkflowField(wf.id, "buttonText", e.target.value)}
-                                className={`w-full p-1.5 rounded border text-xs ${
-                                  isOverLimit
-                                    ? "border-red-400 bg-red-50 text-red-700 focus:ring-red-300"
-                                    : isNearLimit
-                                    ? "border-orange-400 bg-orange-50"
-                                    : "bg-gray-50"
-                                }`}
-                                placeholder="Max 20 characters"
-                              />
-                              {/* ✅ Character counter */}
-                              <p className={`text-xs mt-0.5 font-medium ${
-                                isOverLimit ? "text-red-600" : isNearLimit ? "text-orange-500" : "text-gray-400"
-                              }`}>
-                                {charCount}/20
-                                {isOverLimit && ` — shorten by ${charCount - 20} char${charCount - 20 > 1 ? "s" : ""}`}
-                              </p>
-                            </div>
-                            <div>
-                              <label className="block text-xs text-gray-600 mb-1">Action Type</label>
-                              <select
-                                value={wf.workflow}
-                                onChange={(e) => updateWorkflowField(wf.id, "workflow", e.target.value)}
-                                className="w-full p-1.5 rounded border text-xs bg-gray-50"
-                              >
-                                <option value="Visit Website">Visit Website</option>
-                                <option value="Shop Our Collection">Shop Our Collection</option>
-                                <option value="Talk with Our Team">Talk With Our Team</option>
-                                <option value="Product Suggestions">Product Suggestions</option>
-                              </select>
-                            </div>
-                          </div>
-                          {wf.workflow === "Visit Website" && (
-                            <div>
-                              <label className="block text-xs text-gray-600 mb-1">Website URL</label>
-                              <input
-                                type="url"
-                                value={wf.url || ""}
-                                onChange={(e) => updateWorkflowField(wf.id, "url", e.target.value)}
-                                placeholder="https://example.com"
-                                className="w-full p-1.5 rounded border text-xs bg-gray-50"
-                              />
-                            </div>
-                          )}
-                          {workflows.length > 1 && (
-                            <div className="flex justify-end">
-                              <button
-                                onClick={() => removeWorkflow(wf.id)}
-                                className="px-2 py-1 text-xs bg-red-50 text-red-600 border border-red-200 rounded hover:bg-red-100 transition-colors"
-                              >
-                                Remove
-                              </button>
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
                 </div>
-              )}
+              </div>
+            </div>
 
-              {/* Custom Response Messages */}
-              {welcomeMessageType === "Interactive" && (
-                <div>
-                  <h3 className="text-sm font-semibold text-gray-700 mb-3">Custom Response Messages</h3>
-                  <div className="space-y-3">
-                    {workflows.filter((w) => w.workflow !== "Visit Website").map((w) => (
-                      <div key={w.workflow} className="bg-white p-3 rounded-lg border">
-                        <label className="block text-xs text-gray-600 mb-1">{w.workflow} response</label>
-                        <textarea
-                          value={getWorkflowMessage(w.workflow)}
-                          onChange={(e) => updateWorkflowMessage(w.workflow, e.target.value)}
-                          rows={2}
-                          className="w-full p-1.5 rounded border text-xs bg-gray-50 resize-none"
-                        />
-                        <div className="text-xs text-gray-400 mt-1">
-                          Characters: {getWorkflowMessage(w.workflow).length}
-                        </div>
-                      </div>
-                    ))}
+            {/* Interactive Actions card */}
+            {welcomeMessageType === "Interactive" && (
+              <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5">
+                <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+                  <div>
+                    <h2 className="text-sm font-bold text-gray-800">Action Buttons</h2>
+                    <p className="text-[11px] text-gray-400 mt-0.5">
+                      {interactiveType === "Button"
+                        ? "Button mode: max 3 buttons, each visible directly"
+                        : "List mode: up to 4 options shown in a scrollable list"}
+                    </p>
                   </div>
+                  <ModeToggle
+                    mode={interactiveType}
+                    onChange={handleInteractiveTypeChange}
+                    buttonCount={workflows.length}
+                  />
                 </div>
-              )}
 
-              {/* ✅ FIXED Save Button - desktop */}
-              <div className="pt-2 hidden sm:block">
-                <button
-                  onClick={saveConfig}
-                  disabled={saving || hasButtonErrors}
-                  className={`w-full py-2.5 rounded-lg text-white text-sm font-medium transition-all flex items-center justify-center gap-2 ${
-                    hasButtonErrors
-                      ? "bg-gray-400 cursor-not-allowed"
-                      : saving
-                      ? "bg-emerald-400 cursor-wait"
-                      : "bg-emerald-600 hover:bg-emerald-700 active:scale-[0.98]"
-                  }`}
-                >
-                  {saving ? (
-                    <>
-                      <div className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
-                      Saving...
-                    </>
-                  ) : (
-                    <>
-                      <Save className="w-4 h-4" />
-                      Save Configuration
-                    </>
-                  )}
-                </button>
-                {hasButtonErrors && (
-                  <p className="text-xs text-red-500 text-center mt-1">
-                    Fix button text lengths to enable saving
+                {/* Info banner */}
+                <div className={`flex items-start gap-2 p-3 rounded-xl mb-4 text-xs ${
+                  interactiveType === "Button"
+                    ? "bg-blue-50 border border-blue-100 text-blue-700"
+                    : "bg-violet-50 border border-violet-100 text-violet-700"
+                }`}>
+                  <Info className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+                  {interactiveType === "Button"
+                    ? "Buttons appear directly below your message — best for 1–3 clear choices."
+                    : "List shows a 'View options' button that opens a scrollable menu — ideal for 4 options."}
+                </div>
+
+                {/* Error banner */}
+                {(Object.keys(buttonErrors).length > 0 || Object.keys(urlErrors).length > 0) && (
+                  <div className="flex items-start gap-2 p-3 bg-red-50 border border-red-200 rounded-xl mb-4 text-xs text-red-700">
+                    <AlertCircle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+                    <div>
+                      <p className="font-semibold">Please fix these issues before saving:</p>
+                      <ul className="mt-1 space-y-0.5 list-disc list-inside">
+                        {Object.values(buttonErrors).map((e, i) => <li key={i}>{e}</li>)}
+                        {Object.values(urlErrors).map((e, i) => <li key={i}>{e}</li>)}
+                      </ul>
+                    </div>
+                  </div>
+                )}
+
+                {/* Workflow cards */}
+                <div className="space-y-3">
+                  {workflows.map((wf) => (
+                    <WorkflowCard
+                      key={wf.id}
+                      wf={wf}
+                      onUpdate={updateWorkflow}
+                      onRemove={removeWorkflow}
+                      canRemove={workflows.length > 1}
+                      mode={interactiveType}
+                    />
+                  ))}
+                </div>
+
+                {/* Add action */}
+                {workflows.length < maxWorkflows && availableToAdd.length > 0 && (
+                  <div className="mt-3">
+                    <select
+                      onChange={(e) => { if (e.target.value) { addWorkflow(e.target.value); e.target.value = ""; } }}
+                      defaultValue=""
+                      className="w-full px-3 py-2 rounded-xl border border-dashed border-gray-300 text-sm bg-white text-gray-500 outline-none hover:border-emerald-400 cursor-pointer transition-colors"
+                    >
+                      <option value="">+ Add an action ({workflows.length}/{maxWorkflows} used)</option>
+                      {availableToAdd.map((t) => (
+                        <option key={t} value={t}>{t}</option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
+                {workflows.length >= maxWorkflows && (
+                  <p className="mt-3 text-center text-[11px] text-gray-400">
+                    {interactiveType === "Button"
+                      ? "Maximum 3 buttons reached. Switch to List mode to add a 4th option."
+                      : "Maximum 4 options reached."}
                   </p>
                 )}
               </div>
+            )}
+
+            {/* Response Messages card */}
+            {welcomeMessageType === "Interactive" && (
+              <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5">
+                <h2 className="text-sm font-bold text-gray-800 mb-1">Response Messages</h2>
+                <p className="text-[11px] text-gray-400 mb-4">
+                  These messages are sent when a customer taps each button
+                </p>
+                <div className="space-y-3">
+                  {workflows
+                    .filter((w) => w.workflow !== "Visit Website")
+                    .map((w) => {
+                      const Icon = WORKFLOW_ICONS[w.workflow] || Globe;
+                      const colorClass = WORKFLOW_COLORS[w.workflow] || "";
+                      const msg = getWorkflowMessage(w.workflow);
+                      return (
+                        <div key={w.workflow} className="rounded-xl border border-gray-100 p-3">
+                          <div className={`flex items-center gap-1.5 mb-2 text-xs font-semibold px-2 py-0.5 rounded-full w-fit border ${colorClass}`}>
+                            <Icon className="w-3 h-3" />
+                            {w.workflow}
+                          </div>
+                          <textarea
+                            value={msg}
+                            onChange={(e) => updateWorkflowMessage(w.workflow, e.target.value)}
+                            rows={3}
+                            className="w-full px-3 py-2 rounded-xl border border-gray-200 text-xs bg-gray-50 resize-none outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100"
+                          />
+                          <p className="text-[10px] text-gray-400 mt-0.5">{msg.length} characters</p>
+                        </div>
+                      );
+                    })}
+                </div>
+              </div>
+            )}
+
+            {/* Save button (desktop) */}
+            <div className="hidden sm:block">
+              <button
+                onClick={saveConfig}
+                disabled={saving || hasErrors}
+                className={`w-full py-3 rounded-2xl text-white text-sm font-semibold shadow-sm flex items-center justify-center gap-2 transition-all ${
+                  hasErrors
+                    ? "bg-gray-300 cursor-not-allowed"
+                    : saving
+                    ? "bg-emerald-400 cursor-wait"
+                    : "bg-emerald-600 hover:bg-emerald-700 active:scale-[0.99]"
+                }`}
+              >
+                {saving ? (
+                  <>
+                    <div className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
+                    Saving...
+                  </>
+                ) : (
+                  <>
+                    <Save className="w-4 h-4" />
+                    {hasErrors ? "Fix errors above to save" : "Save Configuration"}
+                  </>
+                )}
+              </button>
             </div>
           </div>
 
-          {/* ── RIGHT: Phone Preview ── */}
-          <div className="lg:sticky lg:top-4">
-            <div className="bg-white rounded-xl border shadow-sm p-3 sm:p-4">
-              <div className="text-center mb-3">
-                <h3 className="text-sm font-semibold text-gray-800">Live Preview</h3>
-                <p className="text-xs text-gray-500">Real-time preview of the welcome message</p>
+          {/* RIGHT: Preview */}
+          <div className="lg:sticky lg:top-5 lg:self-start">
+            <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4">
+              <div className="text-center mb-4">
+                <h3 className="text-sm font-bold text-gray-800">Live Preview</h3>
+                <p className="text-[11px] text-gray-400 mt-0.5">
+                  {interactiveType === "Button" ? "Button layout" : "List layout"}
+                </p>
               </div>
+              <PhonePreview
+                headerText={headerText}
+                messageBody={messageBody}
+                workflows={workflows}
+                interactiveType={interactiveType}
+                welcomeMessageType={welcomeMessageType}
+              />
 
-              {/* Phone Shell */}
-              <div className="flex justify-center">
-                <div
-                  className="relative flex flex-col rounded-[2rem] overflow-hidden border-[6px] border-gray-800 bg-gray-800 shadow-2xl"
-                  style={{ width: 260, height: 520 }}
-                >
-                  {/* Notch */}
-                  <div className="absolute top-0 left-1/2 -translate-x-1/2 w-20 h-5 bg-gray-800 rounded-b-xl z-10" />
-
-                  {/* Screen */}
-                  <div className="flex flex-col flex-1 bg-gray-100 overflow-hidden rounded-[1.4rem]">
-
-                    {/* WhatsApp top bar */}
-                    <div className="bg-[#075e54] text-white px-3 pt-6 pb-2 flex items-center gap-2 flex-shrink-0">
-                      <svg className="w-3 h-3 flex-shrink-0" viewBox="0 0 24 24" fill="none">
-                        <path d="M10 19l-7-7 7-7" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
-                      </svg>
-                      <div className="w-6 h-6 rounded-full bg-emerald-400 flex items-center justify-center flex-shrink-0">
-                        <span className="text-[8px] font-bold text-white">W</span>
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        <div className="text-[10px] font-semibold truncate leading-none">WhatsApp Chat</div>
-                        <div className="text-[8px] text-emerald-200 leading-none mt-0.5">online</div>
-                      </div>
-                    </div>
-
-                    {/* Chat area */}
-                    <div
-                      className="flex-1 overflow-y-auto px-2 py-3"
-                      style={{
-                        backgroundImage: "url(\"data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%23d1fae5' fill-opacity='0.3'%3E%3Cpath d='M36 34v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zm0-30V0h-2v4h-4v2h4v4h2V6h4V4h-4zM6 34v-4H4v4H0v2h4v4h2v-4h4v-2H6zM6 4V0H4v4H0v2h4v4h2V6h4V4H6z'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E\")",
-                        backgroundColor: "#e5ddd5",
-                      }}
-                    >
-                      <div className="flex justify-start">
-                        <div className="bg-white rounded-lg rounded-tl-none shadow-sm px-2.5 py-2 max-w-[92%]" style={{ minWidth: 120 }}>
-                          {headerText && (
-                            <div className="text-[10px] font-bold text-gray-900 mb-1 leading-tight">{headerText}</div>
-                          )}
-                          <div className="text-[10px] text-gray-700 leading-relaxed whitespace-pre-wrap break-words">{messageBody}</div>
-                          <div className="text-right text-[8px] text-gray-400 mt-1">Just now ✓✓</div>
-                        </div>
-                      </div>
-
-                      {welcomeMessageType === "Interactive" && workflows.length > 0 && (
-                        <div className="mt-1 space-y-1 max-w-[92%]">
-                          {workflows.map((w) => (
-                            <div
-                              key={w.id}
-                              className={`flex items-center justify-center gap-1 w-full py-1.5 border rounded-lg shadow-sm ${
-                                w.buttonText.length > 20 ? "bg-red-50 border-red-300" : "bg-white border-gray-200"
-                              }`}
-                            >
-                              <span className={`text-[9px] font-medium truncate px-1 ${
-                                w.buttonText.length > 20 ? "text-red-600" : "text-[#075e54]"
-                              }`}>
-                                {w.buttonText.length > 20
-                                  ? `⚠ ${w.buttonText.substring(0, 20)}...`
-                                  : w.buttonText}
-                              </span>
-                              {w.workflow === "Visit Website" && w.url && (
-                                <ExternalLink className="w-2 h-2 text-[#075e54] flex-shrink-0" />
-                              )}
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-
-                    {/* Input bar */}
-                    <div className="bg-[#f0f0f0] px-2 py-1.5 flex items-center gap-1.5 flex-shrink-0">
-                      <Smile className="w-4 h-4 text-gray-500 flex-shrink-0" />
-                      <div className="flex-1 bg-white rounded-full px-2 py-1 text-[9px] text-gray-400">Type a message</div>
-                      <div className="bg-[#075e54] rounded-full p-1.5 flex-shrink-0">
-                        <Send className="w-2.5 h-2.5 text-white" />
-                      </div>
-                    </div>
-                  </div>
+              {/* Mode summary */}
+              <div className="mt-4 space-y-2">
+                <div className="flex items-center justify-between text-[11px] text-gray-500 px-1">
+                  <span>Mode</span>
+                  <span className="font-semibold text-gray-700">
+                    {welcomeMessageType === "Interactive" ? `${interactiveType} (${workflows.length} actions)` : "Simple Text"}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between text-[11px] text-gray-500 px-1">
+                  <span>Trigger words</span>
+                  <span className="font-semibold text-gray-700">
+                    {triggerWordsInput.split(",").filter(Boolean).length}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between text-[11px] text-gray-500 px-1">
+                  <span>Bot status</span>
+                  <span className={`font-semibold ${isBotActive ? "text-emerald-600" : "text-gray-400"}`}>
+                    {isBotActive ? "● Active" : "○ Inactive"}
+                  </span>
                 </div>
               </div>
             </div>
           </div>
         </div>
+      </div>
 
-        {/* ✅ FIXED: Floating Save on mobile */}
-        <div className="sm:hidden">
-          <div className="fixed left-1/2 -translate-x-1/2 bottom-4 z-50 w-[min(92%,420px)]">
-            <button
-              onClick={saveConfig}
-              disabled={saving || hasButtonErrors}
-              className={`w-full py-3 rounded-full text-white font-medium shadow-lg flex items-center justify-center gap-2 transition-all ${
-                hasButtonErrors
-                  ? "bg-gray-400 cursor-not-allowed"
-                  : saving
-                  ? "bg-emerald-400"
-                  : "bg-emerald-600"
-              }`}
-            >
-              {saving ? (
-                <>
-                  <div className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
-                  Saving...
-                </>
-              ) : (
-                <>
-                  <Save className="w-4 h-4" />
-                  {hasButtonErrors ? "Fix errors to save" : "Save Configuration"}
-                </>
-              )}
-            </button>
-          </div>
-        </div>
+      {/* Mobile save button */}
+      <div className="sm:hidden fixed bottom-0 left-0 right-0 p-4 bg-white border-t border-gray-100 shadow-lg z-40">
+        <button
+          onClick={saveConfig}
+          disabled={saving || hasErrors}
+          className={`w-full py-3 rounded-2xl text-white text-sm font-semibold flex items-center justify-center gap-2 transition-all ${
+            hasErrors
+              ? "bg-gray-300 cursor-not-allowed"
+              : saving
+              ? "bg-emerald-400"
+              : "bg-emerald-600"
+          }`}
+        >
+          {saving ? (
+            <>
+              <div className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
+              Saving...
+            </>
+          ) : (
+            <>
+              <Save className="w-4 h-4" />
+              {hasErrors ? "Fix errors to save" : "Save Configuration"}
+            </>
+          )}
+        </button>
       </div>
     </div>
   );

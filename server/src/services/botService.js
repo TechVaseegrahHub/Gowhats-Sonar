@@ -1,91 +1,102 @@
-// services/botService.js - IMPROVED VERSION
 const BotStatus = require('../models/BotStatus');
-const BotConfiguration = require('../models/BotConfiguration'); // Use correct model
 const KnowledgeBase = require('../models/KnowledgeBase');
-const { getWhatsAppRAGResponse } = require('./openaiService');
+const Settings = require('../models/settings');
+const { getAgentResponse } = require('./gowhatsAgentService');
 
+/**
+ * Get a tenant's agent API key from their Settings document.
+ */
+async function getTenantApiKey(tenantId) {
+  const settings = await Settings.findOne({ tenant_id: tenantId }).lean();
+  return settings?.aiConfig?.agentApiKey || null;
+}
+
+/**
+ * Generate an AI response for an incoming WhatsApp message.
+ * Returns null if the bot should stay silent (bot is off, no KB, etc.)
+ *
+ * @param {string} userMessage - Raw WhatsApp message text
+ * @param {string} tenantId - GoWhats tenant ID
+ * @param {string} phoneNumber - Customer phone number (used for conversation memory)
+ * @returns {string|null} Response text, or null to stay silent
+ */
 const findRelevantResponse = async (userMessage, tenantId, phoneNumber = 'unknown') => {
   try {
-    console.log(`🤖 Bot query for tenant ${tenantId}: "${userMessage.substring(0, 50)}..."`);
+    console.log(`🤖 Incoming message for tenant ${tenantId} from ${phoneNumber}: "${userMessage.substring(0, 60)}..."`);
 
-    // STEP 1: Check if bot is ON
+    // 1. Check bot is ON
     const botStatus = await BotStatus.findOne({ tenantId });
     if (!botStatus || botStatus.status !== 'online') {
-      console.log(`❌ Bot is OFF for tenant ${tenantId}`);
-      return null; // Don't respond when bot is off
+      console.log(`❌ Bot is offline for tenant ${tenantId}`);
+      return null;
     }
 
-    // STEP 2: Check knowledge base exists and has data
-    const knowledgeBase = await KnowledgeBase.findOne({
-      tenantId,
-      hasKnowledgeBase: true
-    });
-
-    if (!knowledgeBase || !knowledgeBase.vectors || knowledgeBase.vectors.length === 0) {
-      console.log(`❌ No knowledge base data for tenant ${tenantId}`);
-      return "I don't have access to our product information right now. Please contact our support team for assistance.";
+    // 2. Check knowledge base exists
+    const knowledgeBase = await KnowledgeBase.findOne({ tenantId, hasKnowledgeBase: true });
+    if (!knowledgeBase) {
+      console.log(`❌ No knowledge base for tenant ${tenantId}`);
+      return null;
     }
 
-    console.log(`✅ Knowledge base found: ${knowledgeBase.chunksCount} chunks, ${knowledgeBase.vectors.filter(v => v.embedding?.length > 0).length} embeddings`);
+    // 3. Get tenant's agent API key
+    const tenantApiKey = await getTenantApiKey(tenantId);
+    if (!tenantApiKey) {
+      console.log(`❌ No agent API key for tenant ${tenantId}`);
+      return null;
+    }
 
-    // STEP 3: Get RAG response with improved error handling
-    const response = await getWhatsAppRAGResponse(userMessage, knowledgeBase, tenantId, phoneNumber);
+    // 4. Call Python agent
+    const response = await getAgentResponse(userMessage, tenantId, phoneNumber, tenantApiKey);
 
-    if (response && response.trim() && !response.includes('I cannot find information')) {
-      console.log(`✅ Generated response for tenant ${tenantId}: ${response.substring(0, 100)}...`);
+    if (response && response.trim()) {
+      console.log(`✅ Response for tenant ${tenantId}: "${response.substring(0, 80)}..."`);
       return response;
     }
 
-    // Enhanced fallback for unmatched queries
-    console.log(`❌ No relevant match found for: "${userMessage}"`);
-    return "I can help you with information about our products and services. Could you please rephrase your question or ask about a specific product?";
+    console.log(`⚠️ Empty response from agent for tenant ${tenantId}`);
+    return null;
 
   } catch (error) {
-    console.error('❌ Bot response error:', error);
-    return "I'm experiencing some technical difficulties. Please try again in a moment or contact our support team.";
+    console.error('❌ findRelevantResponse error:', error);
+    return null;
   }
 };
 
-// Enhanced bot decision logic
-const shouldBotRespond = async (phoneNumber, tenantId, message, contact, isNewContact) => {
+/**
+ * Decide whether the bot should respond to this message at all.
+ * Fast check — avoids unnecessary DB lookups in the message handler.
+ *
+ * @param {string} phoneNumber - Customer phone number
+ * @param {string} tenantId - GoWhats tenant ID
+ * @param {string} message - Raw message text
+ * @returns {boolean}
+ */
+const shouldBotRespond = async (phoneNumber, tenantId, message) => {
   try {
-    console.log(`🔍 Checking if bot should respond for ${phoneNumber}:`, {
-      messageLength: message?.length,
-      tenantId,
-      isNewContact
-    });
-
     // Basic validation
-    if (!message || typeof message !== 'string' || message.trim().length === 0) {
-      console.log(`❌ Invalid message - no response`);
-      return false;
-    }
-
-    // Check if message is too short (likely not a real question)
-    if (message.trim().length < 3) {
-      console.log(`❌ Message too short - no response`);
+    if (!message || typeof message !== 'string' || message.trim().length < 2) {
       return false;
     }
 
     // Check bot status
     const botStatus = await BotStatus.findOne({ tenantId });
     if (!botStatus || botStatus.status !== 'online') {
-      console.log(`❌ Bot is offline for tenant ${tenantId}`);
       return false;
     }
 
     // Check knowledge base
-    const knowledgeBase = await KnowledgeBase.findOne({
-      tenantId,
-      hasKnowledgeBase: true
-    });
-
-    if (!knowledgeBase || !knowledgeBase.vectors || knowledgeBase.vectors.length === 0) {
-      console.log(`❌ No knowledge base - no response`);
+    const knowledgeBase = await KnowledgeBase.findOne({ tenantId, hasKnowledgeBase: true });
+    if (!knowledgeBase) {
       return false;
     }
 
-    console.log(`✅ Bot will respond to ${phoneNumber}`);
+    // Check agent API key exists
+    const tenantApiKey = await getTenantApiKey(tenantId);
+    if (!tenantApiKey) {
+      return false;
+    }
+
+    console.log(`✅ Bot will respond to ${phoneNumber} for tenant ${tenantId}`);
     return true;
 
   } catch (error) {

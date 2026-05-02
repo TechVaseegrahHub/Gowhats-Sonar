@@ -39,6 +39,10 @@ const orderItemSchema = new mongoose.Schema({
   retailerId: String,
   catalogId: String,
   sku: String,
+  color: String,
+  size: String,
+  variantGroup: String,
+  variantLabel: String,
   imageUrl: String,
   description: String,
   countryOfOrigin: { type: String, default: 'India' },
@@ -460,7 +464,10 @@ orderSchema.methods.getPaymentSummary = function() {
       name: item.name,
       quantity: item.quantity,
       price: item.price,
-      retailer_id: item.retailerId
+      retailer_id: item.retailerId,
+      color: item.color,
+      size: item.size,
+      variant_label: item.variantLabel
     })),
     orderAmount: this.orderAmount,
     shippingCost: this.shippingCost,

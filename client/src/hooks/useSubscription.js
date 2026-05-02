@@ -27,6 +27,12 @@ const DEFAULT_SUBSCRIPTION = {
     currency: 'INR',
     billingCycleDays: 30
   },
+  billing: {
+    provider: 'internal',
+    requiresShopifyBilling: false,
+    hasActiveShopifySubscription: false,
+    subscriptionId: ''
+  },
   referral: {
     hasReferral: false,
     referralCode: '',
@@ -84,6 +90,10 @@ export default function useSubscription(options = {}) {
         pricing: {
           ...DEFAULT_SUBSCRIPTION.pricing,
           ...(payload.pricing || {})
+        },
+        billing: {
+          ...DEFAULT_SUBSCRIPTION.billing,
+          ...(payload.billing || {})
         },
         referral: {
           ...DEFAULT_SUBSCRIPTION.referral,
@@ -161,6 +171,10 @@ export default function useSubscription(options = {}) {
               ...prev.pricing,
               ...(nextSubscription.pricing || {})
             },
+        billing: {
+          ...prev.billing,
+          ...(nextSubscription.billing || {})
+        },
         referral: preserveResolvedPricing
           ? prev.referral
           : {

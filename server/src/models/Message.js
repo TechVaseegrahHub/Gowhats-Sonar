@@ -329,6 +329,22 @@ messageSchema.post('save', async function(doc) {
   }
 });
 
+messageSchema.post('save', async function(doc) {
+  try {
+    const wasNew = doc?.$locals?.wasNew;
+    if (!wasNew) return;
+    if (doc?.status !== 'received') return;
+    if (doc?.isHistorical) return;
+    if (doc?.sentFromWABA) return;
+    if (doc?.systemMessage?.type) return;
+
+    const { sendInboundMessageNotification } = require('../services/webPushService');
+    await sendInboundMessageNotification(doc.toObject());
+  } catch (error) {
+    console.error('Failed to send inbound push notification:', error);
+  }
+});
+
 // ✅ INDEXES
 messageSchema.index({ tenantId: 1, isPaymentMessage: 1 });
 messageSchema.index({ tenantId: 1, 'orderData.paymentDetails.referenceId': 1 });

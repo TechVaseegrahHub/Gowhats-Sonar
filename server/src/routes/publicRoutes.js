@@ -2,6 +2,8 @@ const express = require('express');
 const router = express.Router();
 const Order = require('../models/Order');
 const Tenant = require('../models/Tenant');
+const InventoryItem = require('../models/inventory');
+const whatsappSync = require('../services/whatsappSync');
 
 const escapeHtml = (value) =>
   String(value || '')
@@ -243,6 +245,66 @@ router.get('/api/public/order-status/:orderId', async (req, res) => {
   } catch (error) {
     console.error('Error fetching order status:', error);
     res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.post('/sync-inventory', async (req, res) => {
+  try {
+    // Verify secret
+    if (req.headers['x-sync-secret'] !== process.env.SYNC_SECRET) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+
+    const { sku, quantity, price,organisationId } = req.body;
+
+    const item = await InventoryItem.findOne({
+      tenant_id: organisationId,
+      retailer_id: sku 
+    });
+
+    if (!item) return res.status(404).json({ success: false, message: "SKU not found" });
+
+    item.inventory = quantity;
+    item.price = price;
+    item.isBillzzySynced = true;
+    await item.save();
+
+   await whatsappSync.syncSingleProduct(item);
+
+
+    res.status(200).json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+router.post('/bulk-lock-sync', async (req, res) => {
+  try {
+    if (req.headers['x-sync-secret'] !== process.env.SYNC_SECRET) {
+      return res.status(401).json({ success: false });
+    }
+
+    const { organisationId, skus } = req.body;
+   console.log("Searching for Tenant:", organisationId, "with SKUs:", skus);
+
+   const count = await InventoryItem.countDocuments({ tenant_id: organisationId.toString() });
+    console.log("Total items found for this tenant in GoWhats:", count);
+
+    // This flips the switch in MongoDB!
+    const result=await InventoryItem.updateMany(
+      { 
+        tenant_id: organisationId, 
+        retailer_id: { $in: skus } 
+      },
+      { $set: { isBillzzySynced: true } }
+    );
+    console.log("Matched items:", result.matchedCount);
+    console.log("Modified items:", result.modifiedCount);
+
+    res.status(200).json({ success: true, matched: result.matchedCount });
+  } catch (error) {
+    console.error("Lock error:", error);
+    res.status(500).json({ error: error.message });
   }
 });
 

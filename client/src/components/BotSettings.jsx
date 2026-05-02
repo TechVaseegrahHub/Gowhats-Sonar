@@ -1,8 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import { useForm } from 'react-hook-form';
+import BotToggle from './BotToggle.jsx';
 import toast from 'react-hot-toast';
 import { publicApi } from '../utils/axios.js';
 import FileUpload from './FileUpload.jsx';
+import AgentKeyManager from './AgentKeyManager.jsx';
 import {
   Brain,
   Save,
@@ -14,14 +16,17 @@ import {
   AlertCircle,
   CheckCircle2,
   Loader2,
-  Upload
+  Shield
 } from 'lucide-react';
 
 const BotSettings = () => {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [config, setConfig] = useState(null);
-  const [activeTab, setActiveTab] = useState('knowledge'); // 'knowledge' or 'config'
+  const [activeTab, setActiveTab] = useState('knowledge');
+  const [userRole, setUserRole] = useState(null);
+  const [tenantId, setTenantId] = useState(null);
+  const [tenantName, setTenantName] = useState('');
 
   const {
     register,
@@ -67,22 +72,35 @@ const BotSettings = () => {
     }
   });
 
-  const businessType = watch('businessType');
   const includeEmoji = watch('responseConfig.includeEmoji');
 
   useEffect(() => {
     loadConfiguration();
+    loadUserInfo();
   }, []);
+
+  const loadUserInfo = () => {
+    try {
+      const token = localStorage.getItem('token');
+      if (token) {
+        // Decode JWT to get role and tenantId
+        const payload = JSON.parse(atob(token.split('.')[1]));
+        setUserRole(payload.role);
+        setTenantId(payload.tenantId || payload.tenant_id || payload.id);
+        setTenantName(payload.businessName || payload.name || '');
+      }
+    } catch (e) {
+      console.error('Error reading token:', e);
+    }
+  };
 
   const loadConfiguration = async () => {
     try {
       setLoading(true);
       const token = localStorage.getItem('token');
-      
       const response = await publicApi.get('/api/tenant/config', {
         headers: { Authorization: `Bearer ${token}` }
       });
-
       if (response.data.success) {
         setConfig(response.data.config);
         reset(response.data.config);
@@ -99,17 +117,14 @@ const BotSettings = () => {
     try {
       setSaving(true);
       const token = localStorage.getItem('token');
-
       const response = await publicApi.put('/api/tenant/config', data, {
         headers: { Authorization: `Bearer ${token}` }
       });
-
       if (response.data.success) {
         toast.success('Bot configuration saved successfully!');
         setConfig(response.data.config);
       }
     } catch (error) {
-      console.error('Error saving configuration:', error);
       toast.error('Failed to save configuration');
     } finally {
       setSaving(false);
@@ -119,21 +134,16 @@ const BotSettings = () => {
   const applyTemplate = async (templateType) => {
     try {
       const token = localStorage.getItem('token');
-      
       const response = await publicApi.post('/api/tenant/apply-template', {
         businessType: templateType,
         businessName: watch('businessName') || 'My Business'
-      }, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-
+      }, { headers: { Authorization: `Bearer ${token}` } });
       if (response.data.success) {
         toast.success(`${templateType} template applied!`);
         reset(response.data.config);
         setConfig(response.data.config);
       }
     } catch (error) {
-      console.error('Error applying template:', error);
       toast.error('Failed to apply template');
     }
   };
@@ -156,62 +166,111 @@ const BotSettings = () => {
     );
   }
 
+  // Determine tabs to show
+  const isSuperAdmin = userRole === 'super_admin';
+  const tabs = [
+    { id: 'knowledge', label: 'Knowledge Base', icon: Brain },
+    { id: 'config', label: 'Bot Configuration', icon: Settings },
+    ...(isSuperAdmin ? [{ id: 'apikey', label: 'Agent API Key', icon: Shield }] : [])
+  ];
+
   return (
     <div className="p-4 -mt-16 lg:p-8">
       <div className="max-w-7xl mx-auto">
-        
+
         {/* Tab Navigation */}
         <div className="bg-white rounded-xl shadow-sm border border-gray-200 mb-6 overflow-hidden">
-          <div className="flex border-b border-gray-200">
-            <button
-              onClick={() => setActiveTab('knowledge')}
-              className={`flex-1 px-6 py-4 text-sm font-semibold transition-colors ${
-                activeTab === 'knowledge'
-                  ? 'text-emerald-600 border-b-2 border-emerald-600 bg-emerald-50/50'
-                  : 'text-gray-600 hover:text-gray-900 hover:bg-gray-50'
-              }`}
-            >
-              <Brain className="w-5 h-5 inline mr-2" />
-              Knowledge Base
-            </button>
-            <button
-              onClick={() => setActiveTab('config')}
-              className={`flex-1 px-6 py-4 text-sm font-semibold transition-colors ${
-                activeTab === 'config'
-                  ? 'text-emerald-600 border-b-2 border-emerald-600 bg-emerald-50/50'
-                  : 'text-gray-600 hover:text-gray-900 hover:bg-gray-50'
-              }`}
-            >
-              <Settings className="w-5 h-5 inline mr-2" />
-              Bot Configuration
-            </button>
+          <div className="flex border-b border-gray-200 overflow-x-auto">
+            {tabs.map(({ id, label, icon: Icon }) => (
+              <button
+                key={id}
+                onClick={() => setActiveTab(id)}
+                className={`flex-1 min-w-max px-6 py-4 text-sm font-semibold transition-colors flex items-center justify-center space-x-2 ${
+                  activeTab === id
+                    ? 'text-emerald-600 border-b-2 border-emerald-600 bg-emerald-50/50'
+                    : 'text-gray-600 hover:text-gray-900 hover:bg-gray-50'
+                }`}
+              >
+                <Icon className="w-4 h-4" />
+                <span>{label}</span>
+              </button>
+            ))}
           </div>
         </div>
 
-        {/* Knowledge Base Tab */}
+        {/* ── KNOWLEDGE BASE TAB ── */}
         {activeTab === 'knowledge' && (
           <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
-            <div className="bg-gradient-to-r from-emerald-50 via-teal-50 to-cyan-50 px-8 py-12 border-b border-gray-100">
-              <div className="flex items-center space-x-6">
-                <div className="w-16 h-16 bg-gradient-to-br from-emerald-600 to-teal-600 rounded-2xl flex items-center justify-center shadow-lg">
-                  <Brain className="w-8 h-8 text-white" />
+            <div className="bg-gradient-to-r from-emerald-50 via-teal-50 to-cyan-50 px-8 py-10 border-b border-gray-100">
+              <div className="flex items-center space-x-5">
+                <div className="w-14 h-14 bg-gradient-to-br from-emerald-600 to-teal-600 rounded-2xl flex items-center justify-center shadow-lg">
+                  <Brain className="w-7 h-7 text-white" />
                 </div>
                 <div>
-                  <h1 className="text-3xl font-bold text-gray-900">Knowledge Base</h1>
-                  <p className="text-lg text-gray-600 mt-2">Upload your business information for AI training</p>
+                  <h1 className="text-2xl font-bold text-gray-900">Knowledge Base</h1>
+                  <p className="text-gray-600 mt-1">
+                    Upload your catalog file and optionally add your website for AI-powered answers
+                  </p>
                 </div>
               </div>
             </div>
-            <div className="p-8">
-              <FileUpload />
+            <div className="p-8 space-y-6">
+              <BotToggle /> 
+             <FileUpload />
             </div>
           </div>
         )}
 
-        {/* Bot Configuration Tab */}
+        {/* ── AGENT API KEY TAB (super_admin only) ── */}
+        {activeTab === 'apikey' && isSuperAdmin && (
+          <div className="space-y-6">
+            <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
+              <div className="bg-gradient-to-r from-violet-50 to-purple-50 px-8 py-10 border-b border-gray-100">
+                <div className="flex items-center space-x-5">
+                  <div className="w-14 h-14 bg-gradient-to-br from-violet-600 to-purple-600 rounded-2xl flex items-center justify-center shadow-lg">
+                    <Shield className="w-7 h-7 text-white" />
+                  </div>
+                  <div>
+                    <h1 className="text-2xl font-bold text-gray-900">AI Agent API Key</h1>
+                    <p className="text-gray-600 mt-1">
+                      Each tenant needs their own key to access the YoWhats Python AI Agent
+                    </p>
+                  </div>
+                </div>
+              </div>
+              <div className="p-8">
+                <div className="max-w-lg">
+                  <AgentKeyManager
+                    tenantId={tenantId}
+                    tenantName={tenantName}
+                  />
+                </div>
+
+                {/* Info box */}
+                <div className="mt-6 bg-violet-50 border border-violet-200 rounded-xl p-5">
+                  <div className="flex items-start space-x-3">
+                    <AlertCircle className="w-5 h-5 text-violet-600 flex-shrink-0 mt-0.5" />
+                    <div>
+                      <p className="text-sm font-semibold text-violet-900 mb-2">How API keys work</p>
+                      <ul className="text-xs text-violet-800 space-y-1.5">
+                        <li>• Each tenant gets their own isolated API key in the Python AI Agent</li>
+                        <li>• The key links this tenant to their own FAISS vector index</li>
+                        <li>• Tenant A's data is never accessible by Tenant B</li>
+                        <li>• The bot cannot go online without a key — provision it first</li>
+                        <li>• Revoking a key immediately disables the AI bot for this tenant</li>
+                      </ul>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ── BOT CONFIGURATION TAB ── */}
         {activeTab === 'config' && (
           <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
-            
+
             {/* Business Information */}
             <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
               <div className="bg-gradient-to-r from-blue-50 via-indigo-50 to-purple-50 px-8 py-8 border-b border-gray-100">
@@ -225,7 +284,6 @@ const BotSettings = () => {
                   </div>
                 </div>
               </div>
-
               <div className="p-8 space-y-6">
                 <div className="grid md:grid-cols-2 gap-6">
                   <div>
@@ -244,16 +302,13 @@ const BotSettings = () => {
                       <p className="text-red-600 text-sm mt-1">{errors.businessName.message}</p>
                     )}
                   </div>
-
                   <div>
                     <label className="block text-sm font-bold text-gray-900 mb-2">
                       Business Type <span className="text-red-500">*</span>
                     </label>
                     <select
-                      {...register('businessType', { required: 'Business type is required' })}
-                      className={`w-full px-4 py-3 border-2 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/20 ${
-                        errors.businessType ? 'border-red-300' : 'border-gray-300'
-                      }`}
+                      {...register('businessType', { required: true })}
+                      className="w-full px-4 py-3 border-2 border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/20"
                     >
                       <option value="ecommerce">E-commerce / Retail</option>
                       <option value="service">Service Business</option>
@@ -266,11 +321,8 @@ const BotSettings = () => {
                       <option value="custom">Custom</option>
                     </select>
                   </div>
-
                   <div className="md:col-span-2">
-                    <label className="block text-sm font-bold text-gray-900 mb-2">
-                      Industry
-                    </label>
+                    <label className="block text-sm font-bold text-gray-900 mb-2">Industry</label>
                     <input
                       {...register('businessIndustry')}
                       type="text"
@@ -284,27 +336,16 @@ const BotSettings = () => {
                 <div className="bg-gray-50 rounded-xl p-4">
                   <p className="text-sm font-semibold text-gray-900 mb-3">Quick Setup Templates:</p>
                   <div className="flex flex-wrap gap-2">
-                    <button
-                      type="button"
-                      onClick={() => applyTemplate('ecommerce')}
-                      className="px-4 py-2 bg-white border-2 border-gray-300 rounded-lg text-sm font-medium hover:border-blue-500 hover:bg-blue-50 transition-colors"
-                    >
-                      🛍️ E-commerce
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => applyTemplate('service')}
-                      className="px-4 py-2 bg-white border-2 border-gray-300 rounded-lg text-sm font-medium hover:border-purple-500 hover:bg-purple-50 transition-colors"
-                    >
-                      💼 Service Business
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => applyTemplate('restaurant')}
-                      className="px-4 py-2 bg-white border-2 border-gray-300 rounded-lg text-sm font-medium hover:border-orange-500 hover:bg-orange-50 transition-colors"
-                    >
-                      🍕 Restaurant
-                    </button>
+                    {['ecommerce', 'service', 'restaurant'].map((t) => (
+                      <button
+                        key={t}
+                        type="button"
+                        onClick={() => applyTemplate(t)}
+                        className="px-4 py-2 bg-white border-2 border-gray-300 rounded-lg text-sm font-medium hover:border-blue-500 hover:bg-blue-50 transition-colors capitalize"
+                      >
+                        {t === 'ecommerce' ? '🛍️ E-commerce' : t === 'service' ? '💼 Service' : '🍕 Restaurant'}
+                      </button>
+                    ))}
                   </div>
                 </div>
               </div>
@@ -323,8 +364,7 @@ const BotSettings = () => {
                   </div>
                 </div>
               </div>
-
-              <div className="p-8 space-y-6">
+              <div className="p-8">
                 <div className="grid md:grid-cols-2 gap-6">
                   <div>
                     <label className="block text-sm font-bold text-gray-900 mb-2">Bot Name</label>
@@ -335,7 +375,6 @@ const BotSettings = () => {
                       placeholder="Assistant"
                     />
                   </div>
-
                   <div>
                     <label className="block text-sm font-bold text-gray-900 mb-2">Personality</label>
                     <select
@@ -365,7 +404,6 @@ const BotSettings = () => {
                   </div>
                 </div>
               </div>
-
               <div className="p-8 space-y-6">
                 <div className="flex items-center space-x-4 p-4 bg-gray-50 rounded-xl">
                   <input
@@ -378,7 +416,6 @@ const BotSettings = () => {
                     Include emoji in responses
                   </label>
                 </div>
-
                 {includeEmoji && (
                   <div>
                     <label className="block text-sm font-bold text-gray-900 mb-2">Emoji Style</label>
@@ -386,26 +423,21 @@ const BotSettings = () => {
                       {...register('responseConfig.emojiStyle')}
                       type="text"
                       maxLength={2}
-                      className="w-32 px-4 py-3 border-2 border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 text-2xl text-center"
+                      className="w-32 px-4 py-3 border-2 border-gray-300 rounded-xl focus:outline-none text-2xl text-center"
                       placeholder="🤖"
                     />
-                    <p className="text-xs text-gray-600 mt-2">Single emoji only</p>
                   </div>
                 )}
-
                 <div>
-                  <label className="block text-sm font-bold text-gray-900 mb-2">
-                    Max Word Count
-                  </label>
+                  <label className="block text-sm font-bold text-gray-900 mb-2">Max Word Count</label>
                   <input
                     {...register('responseConfig.maxWordCount', { min: 50, max: 300 })}
                     type="number"
                     min="50"
                     max="300"
-                    className="w-32 px-4 py-3 border-2 border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20"
-                    placeholder="150"
+                    className="w-32 px-4 py-3 border-2 border-gray-300 rounded-xl focus:outline-none"
                   />
-                  <p className="text-xs text-gray-600 mt-2">Range: 50-300 words</p>
+                  <p className="text-xs text-gray-500 mt-1">Range: 50–300 words</p>
                 </div>
               </div>
             </div>
@@ -423,126 +455,24 @@ const BotSettings = () => {
                   </div>
                 </div>
               </div>
-
-              <div className="p-8 space-y-6">
-                <div>
-                  <label className="block text-sm font-bold text-gray-900 mb-2">Greeting Message</label>
-                  <textarea
-                    {...register('botConfig.greetingMessage')}
-                    rows={2}
-                    className="w-full px-4 py-3 border-2 border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500/20"
-                    placeholder="I'm here to help you. What would you like to know?"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-sm font-bold text-gray-900 mb-2">Fallback Message</label>
-                  <textarea
-                    {...register('botConfig.fallbackMessage')}
-                    rows={2}
-                    className="w-full px-4 py-3 border-2 border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500/20"
-                    placeholder="I can help you with information from our catalog."
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-sm font-bold text-gray-900 mb-2">Thank You Message</label>
-                  <textarea
-                    {...register('botConfig.thanksMessage')}
-                    rows={2}
-                    className="w-full px-4 py-3 border-2 border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500/20"
-                    placeholder="You're welcome! Anything else I can help you with?"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-sm font-bold text-gray-900 mb-2">Goodbye Message</label>
-                  <textarea
-                    {...register('botConfig.goodbyeMessage')}
-                    rows={2}
-                    className="w-full px-4 py-3 border-2 border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500/20"
-                    placeholder="Feel free to reach out anytime!"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-sm font-bold text-gray-900 mb-2">Negative Response Message</label>
-                  <textarea
-                    {...register('botConfig.noResponseMessage')}
-                    rows={2}
-                    className="w-full px-4 py-3 border-2 border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500/20"
-                    placeholder="Alright! Feel free to ask if you need any information."
-                  />
-                </div>
-              </div>
-            </div>
-
-            {/* Business Terminology */}
-            <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
-              <div className="bg-gradient-to-r from-indigo-50 via-blue-50 to-cyan-50 px-8 py-8 border-b border-gray-100">
-                <div className="flex items-center space-x-4">
-                  <div className="w-12 h-12 bg-gradient-to-br from-indigo-600 to-blue-600 rounded-xl flex items-center justify-center">
-                    <Store className="w-6 h-6 text-white" />
-                  </div>
-                  <div>
-                    <h2 className="text-2xl font-bold text-gray-900">Business Terminology</h2>
-                    <p className="text-gray-600 mt-1">Define terms specific to your business</p>
-                  </div>
-                </div>
-              </div>
-
-              <div className="p-8 space-y-6">
-                <div className="grid md:grid-cols-3 gap-6">
-                  <div>
-                    <label className="block text-sm font-bold text-gray-900 mb-2">
-                      What do you sell?
-                    </label>
-                    <input
-                      {...register('terminology.itemName')}
-                      type="text"
-                      className="w-full px-4 py-3 border-2 border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
-                      placeholder="products, services, dishes"
-                    />
-                    <p className="text-xs text-gray-600 mt-1">Plural form</p>
-                  </div>
-
-                  <div>
-                    <label className="block text-sm font-bold text-gray-900 mb-2">
-                      Catalog Name
-                    </label>
-                    <input
-                      {...register('terminology.catalogName')}
-                      type="text"
-                      className="w-full px-4 py-3 border-2 border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
-                      placeholder="catalog, menu, list"
+              <div className="p-8 space-y-5">
+                {[
+                  { field: 'botConfig.greetingMessage', label: 'Greeting Message', placeholder: "I'm here to help you. What would you like to know?" },
+                  { field: 'botConfig.fallbackMessage', label: 'Fallback Message', placeholder: 'I can help you with information from our catalog.' },
+                  { field: 'botConfig.thanksMessage', label: 'Thank You Message', placeholder: "You're welcome! Anything else I can help you with?" },
+                  { field: 'botConfig.goodbyeMessage', label: 'Goodbye Message', placeholder: 'Feel free to reach out anytime!' },
+                  { field: 'botConfig.noResponseMessage', label: 'Negative Response', placeholder: 'Alright! Feel free to ask if you need any information.' }
+                ].map(({ field, label, placeholder }) => (
+                  <div key={field}>
+                    <label className="block text-sm font-bold text-gray-900 mb-2">{label}</label>
+                    <textarea
+                      {...register(field)}
+                      rows={2}
+                      className="w-full px-4 py-3 border-2 border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500/20"
+                      placeholder={placeholder}
                     />
                   </div>
-
-                  <div>
-                    <label className="block text-sm font-bold text-gray-900 mb-2">
-                      Pricing Term
-                    </label>
-                    <input
-                      {...register('terminology.pricingTerm')}
-                      type="text"
-                      className="w-full px-4 py-3 border-2 border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
-                      placeholder="price, fee, cost"
-                    />
-                  </div>
-                </div>
-
-                <div className="bg-blue-50 rounded-xl p-4 border border-blue-200">
-                  <div className="flex items-start space-x-3">
-                    <AlertCircle className="w-5 h-5 text-blue-600 flex-shrink-0 mt-0.5" />
-                    <div>
-                      <p className="text-sm font-semibold text-blue-900 mb-1">How this works:</p>
-                      <p className="text-sm text-blue-800">
-                        Your bot will use these terms in responses. For example, if you set "dishes" as items, 
-                        the bot will say "I can help you with our dishes" instead of "products."
-                      </p>
-                    </div>
-                  </div>
-                </div>
+                ))}
               </div>
             </div>
 
@@ -559,37 +489,17 @@ const BotSettings = () => {
                   </div>
                 </div>
               </div>
-
               <div className="p-8">
                 <textarea
                   {...register('customInstructions')}
                   rows={6}
                   className="w-full px-4 py-3 border-2 border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-purple-500/20"
-                  placeholder="Example: 'Always mention delivery times', 'Focus on eco-friendly aspects', 'Suggest related products'..."
+                  placeholder="Example: 'Always mention delivery times', 'Focus on eco-friendly aspects'..."
                 />
-                
-                <div className="mt-4 grid md:grid-cols-2 gap-4">
-                  <div className="bg-green-50 rounded-lg p-3 border border-green-200">
-                    <p className="text-xs font-semibold text-green-900 mb-1">Good Examples:</p>
-                    <ul className="text-xs text-green-800 space-y-1">
-                      <li>• "Always mention product certifications"</li>
-                      <li>• "Emphasize our 24-hour delivery"</li>
-                      <li>• "Suggest complementary items"</li>
-                    </ul>
-                  </div>
-                  <div className="bg-amber-50 rounded-lg p-3 border border-amber-200">
-                    <p className="text-xs font-semibold text-amber-900 mb-1">Tips:</p>
-                    <ul className="text-xs text-amber-800 space-y-1">
-                      <li>• Be specific and clear</li>
-                      <li>• Focus on unique selling points</li>
-                      <li>• Include tone preferences</li>
-                    </ul>
-                  </div>
-                </div>
               </div>
             </div>
 
-            {/* Action Buttons */}
+            {/* Save buttons */}
             <div className="flex flex-col sm:flex-row justify-end space-y-4 sm:space-y-0 sm:space-x-4">
               <button
                 type="button"
@@ -599,11 +509,10 @@ const BotSettings = () => {
                 <RefreshCw className="w-5 h-5 mr-2" />
                 Reset Changes
               </button>
-              
               <button
                 type="submit"
                 disabled={saving}
-                className="px-8 py-3 bg-gradient-to-r from-emerald-600 to-teal-600 text-white rounded-xl font-semibold hover:from-emerald-700 hover:to-teal-700 transition-all flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed shadow-lg"
+                className="px-8 py-3 bg-gradient-to-r from-emerald-600 to-teal-600 text-white rounded-xl font-semibold hover:from-emerald-700 hover:to-teal-700 transition-all flex items-center justify-center disabled:opacity-50 shadow-lg"
               >
                 {saving ? (
                   <>
@@ -619,17 +528,17 @@ const BotSettings = () => {
               </button>
             </div>
 
-            {/* Info Notice */}
+            {/* Tips */}
             <div className="bg-gradient-to-r from-blue-50 to-indigo-50 rounded-xl p-6 border border-blue-200">
               <div className="flex items-start space-x-4">
                 <CheckCircle2 className="w-6 h-6 text-blue-600 flex-shrink-0 mt-1" />
                 <div>
                   <h3 className="text-lg font-bold text-blue-900 mb-2">Configuration Tips</h3>
-                  <ul className="text-sm text-blue-800 space-y-2">
+                  <ul className="text-sm text-blue-800 space-y-1.5">
                     <li>• Changes take effect immediately after saving</li>
-                    <li>• Test your bot after making changes to ensure it responds as expected</li>
-                    <li>• Use business templates for quick setup, then customize as needed</li>
-                    <li>• Custom instructions help tailor responses to your specific needs</li>
+                    <li>• Test your bot after making changes</li>
+                    <li>• Use templates for quick setup, then customize</li>
+                    <li>• Upload a knowledge base file before turning the bot ON</li>
                   </ul>
                 </div>
               </div>

@@ -31,6 +31,7 @@ const RegistrationConfig = require('../models/RegistrationConfig');
 const ReferralPayout = require('../models/ReferralPayout');
 const ReferralClient = require('../models/ReferralClient');
 const FlowTrigger = require('../models/FlowTrigger');
+const HitPayService = require('../services/hitpayService');
 const CashfreeService = require('../services/cashfreeService');
 const {
   handleHistoryWebhook,
@@ -43,7 +44,16 @@ const {
   handleOrderConfirmation,
   handleAbandonedCart
 } = require('../services/integrationService');
-
+const {
+  buildOrderFlowPrefill,
+  createOrderFlowPayloadData,
+  loadLatestOrderFlowPrefill,
+  mergeOrderFlowPrefill
+} = require('../utils/orderFlowPrefill');
+const {
+  buildCatalogProductName,
+  buildVariantLabel
+} = require('../utils/inventoryVariants');
 
 // Rate limiting for bot responses
 const botRateLimit = new Map();
@@ -77,6 +87,36 @@ function clearInboundMessageProcessingLock(lockKey, timeoutRef) {
   if (lockKey) {
     processingInboundMessages.delete(lockKey);
   }
+}
+
+function normalizeOrderItemsForStorage(items = []) {
+  return items
+    .map((item) => {
+      const quantity = Math.max(1, parseInt(item?.quantity || 1, 10) || 1);
+      const price = parseFloat(item?.price ?? item?.item_price ?? 0) || 0;
+      const inventoryItemIdRaw = String(item?.inventoryItemId || item?.inventory_item_id || '').trim();
+
+      return {
+        name: String(item?.name || item?.title || item?.product_name || '').trim(),
+        quantity,
+        price,
+        totalPrice: Number((price * quantity).toFixed(2)),
+        currency: String(item?.currency || 'INR').trim() || 'INR',
+        retailerId: String(item?.retailerId || item?.retailer_id || item?.sku || item?.id || '').trim(),
+        catalogId: String(item?.catalogId || item?.catalog_id || '').trim(),
+        sku: String(item?.sku || item?.retailerId || item?.retailer_id || item?.id || '').trim(),
+        color: String(item?.color || '').trim(),
+        size: String(item?.size || '').trim(),
+        variantGroup: String(item?.variantGroup || item?.variant_group || '').trim(),
+        variantLabel: String(item?.variantLabel || item?.variant_label || '').trim(),
+        imageUrl: String(item?.imageUrl || item?.image_url || '').trim(),
+        description: String(item?.description || '').trim(),
+        inventoryItemId: inventoryItemIdRaw && mongoose.Types.ObjectId.isValid(inventoryItemIdRaw)
+          ? inventoryItemIdRaw
+          : undefined
+      };
+    })
+    .filter((item) => item.name);
 }
 
 function checkBotRateLimit(tenantId, phoneNumber) {
@@ -444,39 +484,297 @@ router.post('/razorpay/partner', async (req, res) => {
   }
 });
 
+
+router.post('/hitpay', async (req, res) => {
+  try {
+    console.log('💳 HitPay Webhook Received:', {
+      status: req.body?.status,
+      reference: req.body?.reference_number,
+      timestamp: new Date().toISOString()
+    });
+
+    // ── 1. Validate reference number ──────────────────
+    const orderId = req.body?.reference_number;
+    if (!orderId) {
+      console.warn('⚠️ HitPay webhook: no reference_number in payload');
+      return res.status(200).json({ received: true });
+    }
+
+    // ✅ FIX 1: Duplicate Webhook Memory Lock
+    const processingKey = `hitpay-${orderId}`;
+    if (processingOrders.has(processingKey)) {
+      console.log(`⚠️ DUPLICATE HITPAY WEBHOOK IGNORED for order: ${orderId}`);
+      return res.status(200).json({ received: true });
+    }
+    processingOrders.set(processingKey, Date.now());
+
+    // Auto-cleanup lock after 5 minutes
+    setTimeout(() => {
+      processingOrders.delete(processingKey);
+    }, 5 * 60 * 1000);
+
+    const status = req.body?.status;
+    const paymentId = req.body?.payment_id || req.body?.id;
+
+    // ── 2. Handle completed payment ───────────────────
+    if (status === 'completed') {
+
+      const claimedOrder = await Order.findOneAndUpdate(
+        {
+          orderId,
+          paymentStatus: { $ne: 'completed' },
+          'metadata.confirmationSent': { $ne: true }
+        },
+        {
+          $set: {
+            paymentStatus: 'completed',
+            status: 'confirmed',
+            confirmedAt: new Date(),
+            'paymentDetails.status': 'completed',
+            'paymentDetails.gateway': 'hitpay',
+            'paymentDetails.transactionId': paymentId,
+            'paymentDetails.completedAt': new Date(),
+            'metadata.confirmationSent': true
+          }
+        },
+        { new: true }
+      );
+
+      if (!claimedOrder) {
+        console.log('⚠️ HitPay: already processed by another webhook, skipping:', orderId);
+        return res.status(200).json({ received: true });
+      }
+
+      console.log('✅ HitPay: atomically claimed order for processing:', orderId, paymentId);
+
+      // ── 3. Find tenant ────────────────────────────────
+      const tenant = await Tenant.findById(claimedOrder.tenantId);
+      if (!tenant) {
+        console.warn(`⚠️ HitPay: tenant not found for order: ${orderId}`);
+        return res.status(200).json({ received: true });
+      }
+
+      // ── 4. Verify signature ───────────────────────────
+      const settings = await Settings.findOne({
+        tenant_id: claimedOrder.tenantId.toString()
+      });
+      const hpConfig = settings?.automationConfig?.paymentRequest?.hitpayConfig;
+
+      const hmac = req.headers['x-hitpay-signature'];
+      if (hpConfig?.webhookSalt && hmac) {
+        const hitpay = new HitPayService(hpConfig);
+        const isValid = hitpay.verifyWebhook(req.body, hmac);
+        if (!isValid) {
+          console.error('❌ Invalid HitPay webhook signature');
+          await Order.findOneAndUpdate(
+            { orderId },
+            { $set: { paymentStatus: 'pending', 'metadata.confirmationSent': false } }
+          );
+          return res.status(403).json({ error: 'Invalid signature' });
+        }
+        console.log('✅ HitPay webhook signature verified');
+      }
+
+      // ── 5. Send confirmation ──────────────────────────
+      const hitpayMeta = {
+        phone_number_id: tenant.whatsappConfig?.phoneNumberId
+      };
+
+      const isRegistrationOrder =
+        claimedOrder.source === 'registration_flow' ||
+        claimedOrder.metadata?.isRegistrationOrder === true;
+
+      if (isRegistrationOrder) {
+        console.log('🎟️ HitPay: registration order - generating tickets for:', orderId);
+
+        try {
+          const registrationConfigId = claimedOrder.metadata?.registrationConfigId;
+          const regConfig = registrationConfigId
+            ? await RegistrationConfig.findById(registrationConfigId)
+            : await RegistrationConfig.findOne({
+                tenantId: claimedOrder.tenantId,
+                isActive: true
+              });
+
+          if (!regConfig) {
+            console.error('❌ HitPay: RegistrationConfig not found:', registrationConfigId);
+            await Order.findOneAndUpdate(
+              { orderId },
+              { $set: { 'metadata.confirmationSent': false } }
+            );
+          } else {
+            const participantCount =
+              claimedOrder.participantCount ||
+              claimedOrder.metadata?.participantCount ||
+              claimedOrder.metadata?.totalPax ||
+              1;
+
+            console.log(`👥 HitPay: generating ${participantCount} ticket(s) for order:`, orderId);
+
+            const ticketsGenerated = await generateAndSendMultipleTickets(
+              tenant,
+              claimedOrder.customerPhone,
+              participantCount,
+              regConfig,
+              claimedOrder.customerDetails?.name || 'Guest',
+              {},
+              claimedOrder.orderId
+            );
+
+            if (ticketsGenerated) {
+              await Order.findOneAndUpdate(
+                { orderId },
+                {
+                  $set: {
+                    'metadata.ticketsGenerated': true,
+                    'metadata.ticketsGeneratedAt': new Date()
+                  }
+                }
+              );
+              console.log('✅ HitPay: tickets generated and sent successfully for:', orderId);
+            } else {
+              console.error('❌ HitPay: ticket generation failed for:', orderId);
+              await Order.findOneAndUpdate(
+                { orderId },
+                { $set: { 'metadata.confirmationSent': false } }
+              );
+            }
+          }
+        } catch (ticketErr) {
+          console.error('❌ HitPay: ticket generation error:', ticketErr.message);
+          await Order.findOneAndUpdate(
+            { orderId },
+            { $set: { 'metadata.confirmationSent': false } }
+          );
+        }
+
+      } else {
+        // Standard e-commerce order confirmation
+        console.log('✅ HitPay: sending order confirmation for:', orderId);
+
+        try {
+          await sendOrderConfirmationMessage(
+            claimedOrder,
+            claimedOrder.customerPhone,
+            tenant,
+            hitpayMeta
+          );
+          console.log('✅ HitPay: order confirmation sent successfully for:', orderId);
+        } catch (confirmErr) {
+          console.error('❌ HitPay: confirmation failed:', confirmErr.message);
+          await Order.findOneAndUpdate(
+            { orderId },
+            { $set: { 'metadata.confirmationSent': false } }
+          );
+        }
+      }
+
+      // ── 6. Socket update ──────────────────────────────
+      if (global.io) {
+        global.io.to(claimedOrder.tenantId.toString()).emit('payment_status_update', {
+          orderId,
+          status: 'completed',
+          gateway: 'hitpay',
+          tenantId: claimedOrder.tenantId
+        });
+      }
+
+    // ── 7. Handle failed/expired/canceled ─────────────
+    } else if (['failed', 'expired', 'canceled'].includes(status)) {
+      console.log(`❌ HitPay payment ${status}:`, paymentId);
+
+      const order = await Order.findOne({ orderId }).lean();
+      if (!order) {
+        console.warn(`⚠️ HitPay: order not found for failed payment: ${orderId}`);
+        return res.status(200).json({ received: true });
+      }
+
+      if (order.paymentStatus === 'failed') {
+        console.log('⚠️ HitPay: order already marked failed, skipping');
+        return res.status(200).json({ received: true });
+      }
+
+      await Order.findOneAndUpdate(
+        { orderId },
+        {
+          $set: {
+            paymentStatus: 'failed',
+            'paymentDetails.status': status,
+            'paymentDetails.gateway': 'hitpay',
+            'paymentDetails.failedAt': new Date()
+          }
+        }
+      );
+
+      const tenant = await Tenant.findById(order.tenantId);
+      if (tenant) {
+        try {
+          const whatsappService = new WhatsAppService(tenant);
+          await whatsappService.sendMessage(
+            order.customerPhone,
+            `❌ Payment was not successful for Order #${orderId}. Please try again or contact our team.`
+          );
+        } catch (msgErr) {
+          console.error('❌ HitPay: failed to send failure message:', msgErr.message);
+        }
+
+        if (global.io) {
+          global.io.to(order.tenantId.toString()).emit('payment_status_update', {
+            orderId,
+            status: 'failed',
+            gateway: 'hitpay',
+            tenantId: order.tenantId
+          });
+        }
+      }
+
+    } else {
+      console.log(`ℹ️ HitPay: unhandled status "${status}" for order: ${orderId}`);
+    }
+
+    return res.status(200).json({ received: true });
+
+  } catch (error) {
+    console.error('❌ HitPay webhook error:', error.message, error.stack);
+    return res.status(200).json({ received: true });
+  }
+});
+
+
+
 router.post('/cashfree', async (req, res) => {
   try {
     console.log('💰 Cashfree Webhook Received:', {
       type:      req.body?.type,
       timestamp: new Date().toISOString()
     });
- 
+
     // ── 1. Extract order ID to find tenant ────────────────────
     const orderId = req.body?.data?.order?.order_id;
     if (!orderId) {
       console.warn('⚠️ Cashfree webhook: no order_id in payload');
       return res.status(200).json({ received: true });
     }
- 
+
     const order = await Order.findOne({ orderId });
     if (!order) {
       console.warn(`⚠️ Cashfree webhook: order not found: ${orderId}`);
       return res.status(200).json({ received: true });
     }
- 
+
     const tenant = await Tenant.findById(order.tenantId);
     if (!tenant) {
       console.warn(`⚠️ Cashfree webhook: tenant not found: ${order.tenantId}`);
       return res.status(200).json({ received: true });
     }
- 
+
     const settings = await Settings.findOne({ tenant_id: order.tenantId.toString() });
     const cfConfig  = settings?.automationConfig?.paymentRequest?.cashfreeConfig;
- 
+
     // ── 2. Verify webhook signature ───────────────────────────
     const webhookTimestamp = req.headers['x-webhook-timestamp'];
     const webhookSignature = req.headers['x-webhook-signature'];
- 
+
     if (cfConfig?.clientSecret && webhookTimestamp && webhookSignature) {
       const rawBody  = JSON.stringify(req.body);
       const isValid  = CashfreeService.verifyWebhookSignature(
@@ -490,22 +788,22 @@ router.post('/cashfree', async (req, res) => {
     } else {
       console.warn('⚠️ Cashfree webhook: skipping signature check (missing config or headers)');
     }
- 
+
     // ── 3. Handle event types ─────────────────────────────────
     const eventType = req.body.type;
     const payment   = req.body.data?.payment;
- 
+
     console.log(`📋 Cashfree event: ${eventType} | cf_payment_id: ${payment?.cf_payment_id}`);
- 
+
     // Idempotency check
     if (order.paymentStatus === 'completed' && order.paymentDetails?.gateway === 'cashfree') {
       console.log('⚠️ Cashfree webhook: order already processed, skipping');
       return res.status(200).json({ received: true });
     }
- 
+
     if (eventType === 'PAYMENT_SUCCESS_WEBHOOK' && payment?.payment_status === 'SUCCESS') {
       console.log('✅ Cashfree payment SUCCESS:', payment.cf_payment_id);
- 
+
       const updatedOrder = await Order.findOneAndUpdate(
         { orderId },
         {
@@ -524,10 +822,10 @@ router.post('/cashfree', async (req, res) => {
         },
         { new: true }
       );
- 
+
       // Send order confirmation WhatsApp message
       await sendOrderConfirmationMessage(updatedOrder, updatedOrder.customerPhone, tenant, {});
- 
+
       // Socket update
       if (global.io) {
         global.io.to(order.tenantId.toString()).emit('payment_status_update', {
@@ -537,13 +835,13 @@ router.post('/cashfree', async (req, res) => {
           tenantId:  order.tenantId
         });
       }
- 
+
     } else if (
       eventType === 'PAYMENT_FAILED_WEBHOOK' ||
       payment?.payment_status === 'FAILED'
     ) {
       console.log('❌ Cashfree payment FAILED:', payment?.cf_payment_id);
- 
+
       await Order.findOneAndUpdate(
         { orderId },
         {
@@ -556,20 +854,20 @@ router.post('/cashfree', async (req, res) => {
           }
         }
       );
- 
+
       // Notify customer
       const whatsappService = new WhatsAppService(tenant);
       await whatsappService.sendMessage(
         order.customerPhone,
         `❌ Payment was not successful for Order #${orderId}.\n\nPlease try again or contact our team for assistance.`
       );
- 
+
       if (global.io) {
         global.io.to(order.tenantId.toString()).emit('payment_status_update', {
           orderId, status: 'failed', gateway: 'cashfree', tenantId: order.tenantId
         });
       }
- 
+
     } else if (payment?.payment_status === 'USER_DROPPED') {
       console.log('⚠️ Cashfree payment USER_DROPPED:', payment?.cf_payment_id);
       // User abandoned — don't send failure message, just log
@@ -577,13 +875,13 @@ router.post('/cashfree', async (req, res) => {
         { orderId },
         { $set: { 'paymentDetails.status': 'user_dropped', 'paymentDetails.gateway': 'cashfree' } }
       );
- 
+
     } else {
       console.log(`ℹ️ Unhandled Cashfree event: ${eventType} / status: ${payment?.payment_status}`);
     }
- 
+
     return res.status(200).json({ received: true });
- 
+
   } catch (error) {
     console.error('❌ Cashfree webhook error:', error.message, error.stack);
     return res.status(200).json({ received: true }); // always 200 to prevent retries
@@ -754,13 +1052,13 @@ const shouldSendImageBotResponse = async (messageData, tenant, contact) => {
     console.log('Image bot decision check:', {
       tenantId,
       from: messageData.from,
-     productImageFetchEnabled: isProductImageAIModuleEnabled, 
+     productImageFetchEnabled: isProductImageAIModuleEnabled,
      hasInventory: Boolean(hasInventory),
       botMode: Boolean(contact?.botMode)
     });
 
   if (!isProductImageAIModuleEnabled) {
-      return { shouldRespond: false, reason: 'product_image_ai_disabled' }; 
+      return { shouldRespond: false, reason: 'product_image_ai_disabled' };
    }
 
     if (!hasInventory) {
@@ -968,9 +1266,9 @@ async function handleBotResponse(messageData, tenant, metadata) {
       message: messageData.text?.body?.substring(0, 50),
       tenantId: tenant._id
     });
- 
+
     const userMessage = messageData.text.body.trim();
- 
+
     // Rate limiting (unchanged)
     if (!checkBotRateLimit(tenant._id.toString(), messageData.from)) {
       console.log('BOT: Rate limit exceeded');
@@ -1003,66 +1301,51 @@ async function handleBotResponse(messageData, tenant, metadata) {
       }
       return;
     }
- 
-    // ── Call AgentIQ instead of local RAG ──────────────────────────
-    const axios = require('axios');
-    const AGENTIQ_URL = process.env.AGENTIQ_URL || 'http://localhost:5000';
-    const AGENTIQ_API_KEY = process.env.AGENTIQ_API_KEY || '';
- 
-    let botResponse = null;
-    let shouldEscalate = false;
- 
-    try {
-      console.log('BOT: Calling AgentIQ at', AGENTIQ_URL);
- 
-      const agentResponse = await axios.post(
-        `${AGENTIQ_URL}/api/webhook/whatsapp`,
-        {
-          from: messageData.from,
-          text: userMessage,
-          type: 'text',
-          tenantId: tenant._id.toString()
-        },
-        {
-          headers: {
-            'x-api-key': AGENTIQ_API_KEY,
-            'Content-Type': 'application/json'
-          },
-          timeout: 25000
-        }
-      );
- 
-      // AgentIQ returns { reply, action, leadData }
-      const result = agentResponse.data;
-      botResponse = result.reply || result.text || null;
-      shouldEscalate = result.action === 'escalate';
- 
-      // Handle escalation signal from AgentIQ
-      if (shouldEscalate) {
-        console.log('BOT: AgentIQ requested human escalation');
-        await Contact.findOneAndUpdate(
-          { tenantId: tenant._id.toString(), phone_number: messageData.from },
-          { $set: { botMode: false, humanAgentRequested: true } }
-        );
-        // Let the escalation message from AgentIQ be sent as the reply
-      }
- 
-      console.log('BOT: AgentIQ responded:', {
-        action: result.action,
-        replyLength: botResponse?.length,
-        leadData: result.leadData
-      });
- 
-    } catch (agentError) {
-      console.error('BOT: AgentIQ call failed, using fallback:', agentError.message);
-      botResponse = "Let me help you with that. Could you please be more specific about what you're looking for?";
-    }
- 
+
+  // ── Call Python YoWhats Agent ──────────────────────────────────
+const { getAgentResponse } = require('../services/gowhatsAgentService');
+const Settings = require('../models/settings');
+
+let botResponse = null;
+let shouldEscalate = false;
+
+try {
+  console.log('BOT: Calling YoWhats Agent for tenant:', tenant._id.toString());
+
+  // Get this tenant's agent API key from Settings
+  const tenantSettings = await Settings.findOne({
+    tenant_id: tenant._id.toString()
+  }).lean();
+  const tenantApiKey = tenantSettings?.aiConfig?.agentApiKey || null;
+
+  if (!tenantApiKey) {
+    console.error('BOT: No agent API key for tenant:', tenant._id.toString());
+    botResponse = "I'm setting up. Please try again in a moment.";
+  } else {
+    const reply = await getAgentResponse(
+      userMessage,
+      tenant._id.toString(),
+      messageData.from,
+      tenantApiKey
+    );
+
+    botResponse = reply || null;
+    console.log('BOT: YoWhats Agent responded:', {
+      replyLength: botResponse?.length,
+      preview: botResponse?.substring(0, 60)
+    });
+  }
+
+} catch (agentError) {
+  console.error('BOT: YoWhats Agent call failed:', agentError.message);
+  botResponse = "Let me help you with that. Could you please be more specific about what you're looking for?";
+}
+
     // ── Send the reply ─────────────────────────────────────────────
     if (botResponse && botResponse.trim()) {
       const whatsappService = new WhatsAppService(tenant);
       const response = await whatsappService.sendMessage(messageData.from, botResponse);
- 
+
       if (response) {
         const botMessage = new Message({
           tenantId: tenant._id,
@@ -1077,7 +1360,7 @@ async function handleBotResponse(messageData, tenant, metadata) {
           isAutomatedMessage: true
         });
         await botMessage.save();
- 
+
         // Keep user in bot mode (unless escalating)
         await Contact.findOneAndUpdate(
           { tenantId: tenant._id.toString(), phone_number: messageData.from },
@@ -1090,14 +1373,14 @@ async function handleBotResponse(messageData, tenant, metadata) {
             }
           }
         );
- 
+
         if (global.io) {
           global.io.to(tenant._id.toString()).emit('message_sent', {
             ...botMessage.toObject(),
             contact: { phone_number: messageData.from }
           });
         }
- 
+
         console.log('BOT: AgentIQ reply sent successfully');
       }
     } else {
@@ -1106,7 +1389,7 @@ async function handleBotResponse(messageData, tenant, metadata) {
       const whatsappService = new WhatsAppService(tenant);
       const fallbackMessage = "I can help you with information about our products. Please ask about specific products or type 'human agent' to speak with our team.";
       const fallbackResponse = await whatsappService.sendMessage(messageData.from, fallbackMessage);
- 
+
       if (fallbackResponse) {
         const fallbackMsg = new Message({
           tenantId: tenant._id,
@@ -1130,7 +1413,7 @@ async function handleBotResponse(messageData, tenant, metadata) {
         }
       }
     }
- 
+
   } catch (error) {
     console.error('BOT: Error in AgentIQ response handler:', error);
     try {
@@ -1244,7 +1527,7 @@ if (!matchedProduct) {
         fallbackMessage = "The photo does not look like a product image. Please send a clear product photo.";
       }
 
-  
+
   const fallbackResponse = await whatsappService.sendMessage(customerPhone, fallbackMessage);
 
       await saveAndEmitBotMessage({
@@ -1266,20 +1549,20 @@ if (!matchedProduct) {
     let sentType = 'text';
     let sentText = `Matched product: ${matchedProduct.name}`;
     let sentAsCatalog = false;
- 
+
     const replies = [
-  "Yes, this is available. ", 
-  "Here is the product you asked for", 
-  "This item is available in our store.", 
-  "We have this product available.", 
-  "Here are the product details." 
+  "Yes, this is available. ",
+  "Here is the product you asked for",
+  "This item is available in our store.",
+  "We have this product available.",
+  "Here are the product details."
 ];
 
 const orderMessages = [
-  "You can place your order using the button below 👇", 
-  "Tap the button below to place your order 👇", 
-  "Click the button below if you'd like to order 👇", 
-  "Use the button below to order this product 👇" 
+  "You can place your order using the button below 👇",
+  "Tap the button below to place your order 👇",
+  "Click the button below if you'd like to order 👇",
+  "Use the button below to order this product 👇"
 ];
 
 // Random selections
@@ -1729,20 +2012,20 @@ async function sendDigitalSakthiTicket(tenant, phoneNumber, amountPaid, sessionI
 async function sendCashfreePayment(messageData, order, totalAmount, settings, tenant, metadata) {
   try {
     const cfConfig = settings?.automationConfig?.paymentRequest?.cashfreeConfig;
- 
+
     if (!cfConfig?.clientId || !cfConfig?.clientSecret) {
       throw new Error('Cashfree credentials not configured in tenant settings');
     }
     if (!cfConfig?.paymentConfigurationName) {
       throw new Error('Cashfree WhatsApp payment configuration name not set');
     }
- 
+
     const CashfreeService = require('../services/cashfreeService');
     const cashfree = new CashfreeService(cfConfig);
     const whatsappService = new WhatsAppService(tenant);
- 
+
     console.log(`💳 Cashfree: Creating order ${order.orderId} for ₹${totalAmount}`);
- 
+
     // Step 1+2: Create Cashfree order → get UPI session
     const { cfOrderId, referenceId, merchantVpa, cfPaymentId } =
       await cashfree.createPaymentSession({
@@ -1752,12 +2035,12 @@ async function sendCashfreePayment(messageData, order, totalAmount, settings, te
         customerEmail: order.customerDetails?.email,
         customerName:  order.customerDetails?.name,
       });
- 
+
     // VPA mismatch warning (non-blocking per Cashfree docs)
     if (merchantVpa && cfConfig.merchantVpa && merchantVpa !== cfConfig.merchantVpa) {
       console.warn(`⚠️ VPA mismatch: got ${merchantVpa}, configured ${cfConfig.merchantVpa}. Continuing.`);
     }
- 
+
     // Build WhatsApp Pay payload using Cashfree UPI reference
     const amountInPaise = Math.round(totalAmount * 100);
     const paymentOrderPayload = {
@@ -1792,7 +2075,7 @@ async function sendCashfreePayment(messageData, order, totalAmount, settings, te
         subtotal: { value: amountInPaise, offset: 100 }
       }
     };
- 
+
     const paymentConfig = settings?.automationConfig?.paymentRequest;
     const customMessage = {
       header: (paymentConfig?.template?.header || '💳 Complete Your Payment').substring(0, 60),
@@ -1801,11 +2084,11 @@ async function sendCashfreePayment(messageData, order, totalAmount, settings, te
         .replace('{{order_id}}', order.orderId),
       footer: (paymentConfig?.template?.footer || 'Secure UPI Payment via Cashfree').substring(0, 60)
     };
- 
+
     const response = await whatsappService.sendPaymentOrderDetails(
       messageData.from, paymentOrderPayload, customMessage
     );
- 
+
     if (response) {
       // Store Cashfree payment IDs on the order for webhook reconciliation
       await Order.findOneAndUpdate(
@@ -1820,7 +2103,7 @@ async function sendCashfreePayment(messageData, order, totalAmount, settings, te
           }
         }
       );
- 
+
       const paymentMessage = new Message({
         tenantId:          tenant._id,
         from:              metadata?.phone_number_id || tenant.whatsappConfig?.phoneNumberId || 'system',
@@ -1843,13 +2126,13 @@ async function sendCashfreePayment(messageData, order, totalAmount, settings, te
         }
       });
       await paymentMessage.save();
- 
+
       await Contact.findOneAndUpdate(
         { tenantId: tenant._id.toString(), phone_number: messageData.from },
         { $set: { lastMessage: `Payment Link - Order #${order.orderId}`, timestamp: new Date() } },
         { upsert: true }
       );
- 
+
       if (global.io) {
         global.io.to(tenant._id.toString()).emit('message_sent', {
           ...paymentMessage.toObject(),
@@ -1863,10 +2146,10 @@ async function sendCashfreePayment(messageData, order, totalAmount, settings, te
           tenantId:      tenant._id
         });
       }
- 
+
       console.log('✅ Cashfree UPI payment sent successfully');
     }
- 
+
     return response;
   } catch (error) {
     console.error('❌ Cashfree payment error:', error.message);
@@ -1875,6 +2158,114 @@ async function sendCashfreePayment(messageData, order, totalAmount, settings, te
       await whatsappService.sendMessage(
         messageData.from,
         `We couldn't generate the UPI payment link. Our team will contact you shortly. (Order: ${order.orderId})`
+      );
+    } catch (e) { /* ignore */ }
+    throw error;
+  }
+}
+
+async function sendHitPayPayment(messageData, order, totalAmount, settings, tenant, metadata) {
+  try {
+    const hpConfig = settings?.automationConfig?.paymentRequest?.hitpayConfig;
+    if (!hpConfig?.apiKey) throw new Error('HitPay API key not configured');
+
+    const hitpay = new HitPayService(hpConfig);
+    const whatsappService = new WhatsAppService(tenant);
+
+    const webhookUrl = `${process.env.APP_URL || ''}/webhook/hitpay`;
+    const successUrl = hpConfig.successUrl || undefined;
+
+    console.log(`💳 HitPay: Creating payment for order ${order.orderId}, amount ${totalAmount} ${hpConfig.currency}`);
+
+    const paymentRequest = await hitpay.createPaymentRequest({
+      orderId: order.orderId,
+      amount: totalAmount,
+      customerName: order.customerDetails?.name,
+      customerEmail: order.customerDetails?.email,
+      customerPhone: messageData.from,
+      description: `Order #${order.orderId}`,
+      redirectUrl: successUrl,
+      webhookUrl,
+    });
+
+    const currencySymbol = { SGD: 'S$', MYR: 'RM ', USD: '$', HKD: 'HK$' }[hpConfig.currency] || hpConfig.currency + ' ';
+    const paymentConfig = settings?.automationConfig?.paymentRequest;
+    const template = paymentConfig?.template || {};
+
+    const headerText = (template.header || '💳 Complete Your Payment').substring(0, 60);
+    const footerText = (template.footer || 'Secure Payment via HitPay').substring(0, 60);
+    const bodyText = (
+      (template.body || 'Please complete your payment to confirm your order.')
+        .replace('{{amount}}', `${currencySymbol}${parseFloat(totalAmount).toFixed(2)}`)
+        .replace('{{order_id}}', order.orderId)
+    ).substring(0, 900);
+
+    const axios = require('axios');
+    const messagePayload = {
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: messageData.from,
+      type: 'interactive',
+      interactive: {
+        type: 'cta_url',
+        header: { type: 'text', text: headerText },
+        body: { text: `${bodyText}\n\n📄 *Order ID:* ${order.orderId}\n💰 *Amount:* ${currencySymbol}${parseFloat(totalAmount).toFixed(2)}` },
+        footer: { text: footerText },
+        action: { name: 'cta_url', parameters: { display_text: 'Pay Now', url: paymentRequest.url } }
+      }
+    };
+
+    const response = await axios.post(
+      `${whatsappService.baseUrl}/${whatsappService.phoneNumberId}/messages`,
+      messagePayload,
+      { headers: { Authorization: `Bearer ${whatsappService.accessToken}`, 'Content-Type': 'application/json' } }
+    );
+
+    if (response.data) {
+      await Order.findOneAndUpdate(
+        { orderId: order.orderId, tenantId: tenant._id.toString() },
+        {
+          $set: {
+            'paymentDetails.gateway': 'hitpay',
+            'paymentDetails.hitpayPaymentId': paymentRequest.id,
+            'paymentDetails.paymentUrl': paymentRequest.url,
+            'paymentDetails.status': 'pending',
+          }
+        }
+      );
+
+      await Message.create({
+        tenantId: tenant._id,
+        from: metadata?.phone_number_id || tenant.whatsappConfig?.phoneNumberId,
+        to: messageData.from,
+        text: `HitPay Payment Link: ${currencySymbol}${parseFloat(totalAmount).toFixed(2)} - Order #${order.orderId}`,
+        type: 'interactive', subType: 'order_details',
+        status: 'sent', isAutomatedMessage: true, isPaymentMessage: true,
+        orderId: order.orderId, paymentGateway: 'hitpay',
+        messageId: response.data?.messages?.[0]?.id
+      });
+
+      await Contact.findOneAndUpdate(
+        { tenantId: tenant._id.toString(), phone_number: messageData.from },
+        { $set: { lastMessage: `Payment Link - Order #${order.orderId}`, timestamp: new Date() } },
+        { upsert: true }
+      );
+
+      if (global.io) {
+        global.io.to(tenant._id.toString()).emit('payment_order_sent', {
+          customerPhone: messageData.from, orderId: order.orderId,
+          amount: totalAmount, gateway: 'hitpay', tenantId: tenant._id
+        });
+      }
+    }
+
+    return response.data;
+  } catch (error) {
+    console.error('❌ HitPay payment error:', error.message);
+    try {
+      const whatsappService = new WhatsAppService(tenant);
+      await whatsappService.sendMessage(messageData.from,
+        `We couldn't generate the payment link. Our team will contact you shortly. (Order: ${order.orderId})`
       );
     } catch (e) { /* ignore */ }
     throw error;
@@ -2423,14 +2814,11 @@ async function handlePaymentStatusUpdate(paymentStatus, tenant, metadata) {
 // Send order confirmation message after successful payment
 async function sendOrderConfirmationMessage(order, customerPhone, tenant, metadata) {
   try {
-    // 1. Fetch Settings safely
     const Settings = require('../models/settings');
     let settings = await Settings.findOne({ tenant_id: tenant._id.toString() });
 
-    // 2. Default config if settings are missing
     let confirmConfig = settings?.automationConfig?.orderConfirmation;
 
-    // 3. Check if explicitly disabled
     if (confirmConfig && confirmConfig.enabled === false) {
        console.log('🔕 Order Confirmation disabled for tenant:', tenant._id);
        return;
@@ -2438,57 +2826,89 @@ async function sendOrderConfirmationMessage(order, customerPhone, tenant, metada
 
     console.log('✅ Sending order confirmation for:', order.orderId);
 
-    // 4. Prepare Message (Use fallback if template is missing)
+    // Get the template the user saved from the frontend
     let messageBody = confirmConfig?.template?.body;
 
     if (!messageBody) {
-        messageBody = "✅ Thank you! Your order *{{order_id}}* has been confirmed.\nAmount: {{amount}}";
+        messageBody = "✅ Thank you! Your order *{{order_id}}* has been confirmed.\nAmount: {{amount}}\n\nOrder Details:\n{{items}}";
     }
 
-    // 5. Replace Variables (Add safety checks)
     const amountStr = order.totalAmount ? order.totalAmount.toFixed(2) : '0.00';
-    const currency = order.currency || 'INR';
-    const itemsCount = order.items ? order.items.length : 0;
+    
+    // ✅ 1. DYNAMIC CURRENCY FIX
+    let currencyCode = order.currency || 'INR';
+    if (order.paymentDetails?.currency) {
+        currencyCode = order.paymentDetails.currency.toUpperCase();
+    }
+    const currencySymbols = { SGD: 'S$', USD: '$', GBP: '£', EUR: '€', INR: '₹', MYR: 'RM ', AED: 'AED ' };
+    const currencyDisplay = currencySymbols[currencyCode] || `${currencyCode} `;
+
+    // ✅ 2. ITEMS LIST FIX (Prints names instead of the number '2')
+    let itemsDisplay = '';
+    if (order.items && order.items.length > 0) {
+        // This maps through the items and creates a bulleted list: 
+        // • Item 1 (x1)
+        // • Item 2 (x1)
+        itemsDisplay = order.items.map(item => `• ${item.name} (x${item.quantity})`).join('\n');
+    } else if (order.participantCount) {
+        itemsDisplay = `• Event Registration (x${order.participantCount})`;
+    } else {
+        itemsDisplay = 'Items details not available';
+    }
+
     const custName = order.customerDetails?.name || 'Customer';
 
+    // Replace all variables in the string
     messageBody = messageBody
       .replace('{{order_id}}', order.orderId)
-      .replace('{{amount}}', `${currency} ${amountStr}`)
-      .replace('{{items}}', itemsCount)
+      .replace('{{amount}}', `${currencyDisplay}${amountStr}`)
+      .replace('{{items}}', itemsDisplay)      // <-- Now inserting the bulleted list!
       .replace('{{customer}}', custName);
 
-    // Append Footer
-    messageBody += "\n\nPowered by GoWhats!";
+    // If the user didn't manually put "Powered by GoWhats" in the frontend, append it.
+    if (!messageBody.includes('Powered by GoWhats')) {
+        messageBody += "\n\nPowered by GoWhats!";
+    }
 
     const whatsappService = new WhatsAppService(tenant);
     const response = await whatsappService.sendMessage(customerPhone, messageBody);
 
-    if (response) {
-     const websitePlatform = ['shopify', 'woocommerce'].includes(order?.source)
-        ? order.source
-        : null;    
-  await Message.create({
+    // Check if WhatsApp actually accepted the message
+    if (response && response.messages && response.messages.length > 0) {
+      const websitePlatform = ['shopify', 'woocommerce'].includes(order?.source) ? order.source : null;
+        
+      const savedMessage = await Message.create({
         tenantId: tenant._id,
-       from: metadata?.phone_number_id || tenant?.whatsappConfig?.phoneNumberId || 'system',
+        from: metadata?.phone_number_id || tenant?.whatsappConfig?.phoneNumberId || 'system',
         to: customerPhone,
         text: messageBody,
         type: 'text',
         status: 'sent',
-        messageId: response.messages?.[0]?.id, // Add null check here
-	isOrderConfirmation: true,
+        messageId: response.messages[0].id, 
+        isOrderConfirmation: true,
         orderData: websitePlatform ? {
           orderId: String(order?.orderId || ''),
           orderNumber: String(order?.orderId || ''),
           total: String(order?.totalAmount || ''),
-          currency: order?.currency || 'INR',
+          currency: currencyCode,
           status: order?.status || 'processing',
           platform: websitePlatform,
           customerName: order?.customerDetails?.name || 'Customer',
           customerPhone: customerPhone
         } : undefined
-        
       });
+      
       console.log('✅ Order confirmation sent successfully');
+
+      // ✅ THIS is what updates your UI window instantly
+      if (global.io) {
+        global.io.to(tenant._id.toString()).emit('message_sent', {
+          ...savedMessage.toObject(),
+          contact: { phone_number: customerPhone }
+        });
+      }
+    } else {
+      console.error('❌ Order confirmation failed - WhatsApp API rejected the message:', response);
     }
 
   } catch (error) {
@@ -2539,8 +2959,8 @@ async function processMessageByType(messageData, tenant, metadata) {
     filename: '',
     isFlowCompletion: false,
     isInteractiveResponse: false,
-    quotedMessage: null,  // ✅ NEW
-    replyTo: null         // ✅ NEW
+    quotedMessage: null,
+    replyTo: null
   };
 
   // ✅ NEW: Check if message is a reply
@@ -2668,20 +3088,28 @@ async function processMessageByType(messageData, tenant, metadata) {
               const quantity = parseInt(item.quantity || 1);
               const itemTotal = itemPrice * quantity;
               totalPrice += itemTotal;
+              const displayName = inventoryItem ? buildCatalogProductName(inventoryItem) : (item.title || item.product_retailer_id);
+              const variantLabel = inventoryItem ? buildVariantLabel(inventoryItem) : '';
 
               formattedItems.push({
-		  retailer_id: item.product_retailer_id,
-		  id: item.product_retailer_id,
-		  name: inventoryItem?.name || item.title || item.product_retailer_id,
-		  price: itemPrice,
-		  item_price: itemPrice,
-		  quantity: quantity,
-		  subtotal: itemTotal,
-		  currency: item.currency || inventoryItem?.currency || 'INR',
-		  image_url: inventoryItem?.image_url || item.thumbnail_url || null,
-		  additional_images: inventoryItem?.additional_images || [],
-		  sku: inventoryItem?.sku || inventoryItem?.retailer_id || item.product_retailer_id || '' // ← ADD THIS
-		});
+                retailer_id: item.product_retailer_id,
+                id: item.product_retailer_id,
+             // name: inventoryItem?.name || item.title || item.product_retailer_id,
+                name: displayName,
+                price: itemPrice,
+                item_price: itemPrice,
+                quantity: quantity,
+                subtotal: itemTotal,
+                currency: item.currency || inventoryItem?.currency || 'INR',
+                image_url: inventoryItem?.image_url || item.thumbnail_url || null,
+                additional_images: inventoryItem?.additional_images || [],
+                inventoryItemId: inventoryItem?._id?.toString?.(),
+                color: inventoryItem?.color || '',
+                size: inventoryItem?.size || '',
+                variant_group: inventoryItem?.variant_group || '',
+                variant_label: variantLabel,
+                sku: inventoryItem?.sku || inventoryItem?.retailer_id || item.product_retailer_id || ''
+              });
 
             }
           }
@@ -2690,7 +3118,6 @@ async function processMessageByType(messageData, tenant, metadata) {
           details.text = `Order: ${itemNames} - Total: ${originalOrderData.product_items?.[0]?.currency || 'INR'} ${totalPrice.toFixed(2)}`;
           details.lastMessageText = `Order: ${formattedItems.length} item(s) - ${originalOrderData.product_items?.[0]?.currency || 'INR'} ${totalPrice.toFixed(2)}`;
 
-          // ✅ CRITICAL FIX: Properly structure orderData with all required fields
           details.orderData = {
             catalog_id: originalOrderData.catalog_id,
             text: originalOrderData.text || details.text,
@@ -2999,28 +3426,44 @@ const sendOrderFlowMessage = async (orderData, messageData, tenant, metadata) =>
 
     const template = flowConfig.template || {};
 
-    // ✅ FIX: Define State List (This was missing)
-    const stateList = [
-      { id: "AP", title: "Andhra Pradesh" }, { id: "AR", title: "Arunachal Pradesh" },
-      { id: "AS", title: "Assam" }, { id: "BR", title: "Bihar" },
-      { id: "CT", title: "Chhattisgarh" }, { id: "GA", title: "Goa" },
-      { id: "GJ", title: "Gujarat" }, { id: "HR", title: "Haryana" },
-      { id: "HP", title: "Himachal Pradesh" }, { id: "JH", title: "Jharkhand" },
-      { id: "KA", title: "Karnataka" }, { id: "KL", title: "Kerala" },
-      { id: "MP", title: "Madhya Pradesh" }, { id: "MH", title: "Maharashtra" },
-      { id: "MN", "title": "Manipur" }, { id: "ML", "title": "Meghalaya" },
-      { id: "MZ", "title": "Mizoram" }, { id: "NL", "title": "Nagaland" },
-      { id: "OR", "title": "Odisha" }, { id: "PB", "title": "Punjab" },
-      { id: "RJ", "title": "Rajasthan" }, { id: "SK", "title": "Sikkim" },
-      { id: "TN", "title": "Tamil Nadu" }, { id: "TG", "title": "Telangana" },
-      { id: "TR", "title": "Tripura" }, { id: "UP", "title": "Uttar Pradesh" },
-      { id: "UT", "title": "Uttarakhand" }, { id: "WB", "title": "West Bengal" },
-      { id: "AN", "title": "Andaman and Nicobar Islands" },
-      { id: "CH", "title": "Chandigarh" }, { id: "DN", "title": "Dadra and Nagar Haveli" },
-      { id: "DL", "title": "Delhi" }, { id: "JK", "title": "Jammu and Kashmir" },
-      { id: "LA", "title": "Ladakh" }, { id: "LD", "title": "Lakshadweep" },
-      { id: "PY", "title": "Puducherry" }
-    ];
+// const stateList = [
+//   { id: "AP", title: "Andhra Pradesh" }, { id: "AR", title: "Arunachal Pradesh" },
+//   { id: "AS", title: "Assam" }, { id: "BR", title: "Bihar" },
+//   { id: "CT", title: "Chhattisgarh" }, { id: "GA", title: "Goa" },
+//   { id: "GJ", title: "Gujarat" }, { id: "HR", title: "Haryana" },
+//   { id: "HP", title: "Himachal Pradesh" }, { id: "JH", title: "Jharkhand" },
+//   { id: "KA", title: "Karnataka" }, { id: "KL", title: "Kerala" },
+//   { id: "MP", title: "Madhya Pradesh" }, { id: "MH", title: "Maharashtra" },
+//   { id: "MN", "title": "Manipur" }, { id: "ML", "title": "Meghalaya" },
+//   { id: "MZ", "title": "Mizoram" }, { id: "NL", "title": "Nagaland" },
+//   { id: "OR", "title": "Odisha" }, { id: "PB", "title": "Punjab" },
+//   { id: "RJ", "title": "Rajasthan" }, { id: "SK", "title": "Sikkim" },
+//   { id: "TN", "title": "Tamil Nadu" }, { id: "TG", "title": "Telangana" },
+//   { id: "TR", "title": "Tripura" }, { id: "UP", "title": "Uttar Pradesh" },
+//   { id: "UT", "title": "Uttarakhand" }, { id: "WB", "title": "West Bengal" },
+//   { id: "AN", "title": "Andaman and Nicobar Islands" },
+//   { id: "CH", "title": "Chandigarh" }, { id: "DN", "title": "Dadra and Nagar Haveli" },
+//   { id: "DL", "title": "Delhi" }, { id: "JK", "title": "Jammu and Kashmir" },
+//   { id: "LA", "title": "Ladakh" }, { id: "LD", "title": "Lakshadweep" },
+//   { id: "PY", "title": "Puducherry" }
+// ];
+
+   const directPrefill = buildOrderFlowPrefill(orderData, {
+      fallbackPhone: formattedPhone
+    });
+    const savedPrefill = await loadLatestOrderFlowPrefill({
+      tenantId: tenant._id.toString(),
+      phoneNumber: formattedPhone
+    });
+    const resolvedPrefill = mergeOrderFlowPrefill(directPrefill, savedPrefill);
+    const flowLaunchData = createOrderFlowPayloadData(
+      {
+        order_total: totalAmount,
+        currency: currency,
+        item_count: totalItems
+      },
+      resolvedPrefill
+    );
 
     // 4. Construct Payload
     const messagePayload = {
@@ -3051,14 +3494,16 @@ const sendOrderFlowMessage = async (orderData, messageData, tenant, metadata) =>
             flow_action: 'navigate',
             flow_action_payload: {
               screen: 'DETAILS',
-              data: {
-                order_total: totalAmount,
-                currency: currency,
-                item_count: totalItems,
+
+           // data: {
+              // order_total: totalAmount,
+               // currency: currency,
+               // item_count: totalItems,
                 // ✅ PASS THE STATE LIST HERE
-                state: stateList,
-                states: stateList // Sending as both keys to be safe
-              }
+               // state: stateList,
+               // states: stateList // Sending as both keys to be safe
+             // }
+             data: flowLaunchData
             }
           }
         }
@@ -3103,7 +3548,10 @@ const sendOrderFlowMessage = async (orderData, messageData, tenant, metadata) =>
         flowType: 'order_completion',
         status: 'active',
         createdAt: new Date(),
-        contextData: orderData
+        contextData: {
+          ...(orderData && typeof orderData === 'object' ? orderData : {}),
+          prefill: resolvedPrefill
+        }
       });
 
       // Emit to UI
@@ -3133,15 +3581,19 @@ async function handleFlowCompletionWithShipping(messageData, tenant, metadata) {
     if (!flowReply) return;
 
     let rawFlowData;
-    try { rawFlowData = JSON.parse(flowReply.response_json); } catch (e) { return; }
+    try {
+      rawFlowData = JSON.parse(flowReply.response_json);
+    } catch (e) {
+      return;
+    }
 
     const flowData = rawFlowData.customer_details || rawFlowData.data || rawFlowData;
 
     console.log('🔍 FLOW DATA STATE DEBUG:', {
-    rawState: rawFlowData.state,
-    dataState: rawFlowData.data?.state,
-    flowDataState: flowData.state,
-    allKeys: Object.keys(flowData)
+      rawState: rawFlowData.state,
+      dataState: rawFlowData.data?.state,
+      flowDataState: flowData.state,
+      allKeys: Object.keys(flowData)
     });
 
     // 1. Fetch Settings & Check Toggle
@@ -3155,70 +3607,71 @@ async function handleFlowCompletionWithShipping(messageData, tenant, metadata) {
 
     // 2. Retrieve Token for Price
     const FlowToken = require('../models/FlowToken');
-    const tokenRecord = await FlowToken.findOne({ token: rawFlowData.flow_token, tenantId: tenant._id.toString() });
+    const tokenRecord = await FlowToken.findOne({
+      token: rawFlowData.flow_token,
+      tenantId: tenant._id.toString()
+    });
 
     if (tokenRecord && (tokenRecord.flowType === 'custom' || tokenRecord.contextData?.source === 'flow_trigger')) {
-        console.log('⚡ Non-order flow reached order handler. Redirecting to generic completion handler.', {
-            flowType: tokenRecord.flowType,
-            source: tokenRecord.contextData?.source || 'unknown'
-        });
-        await handleFlowCompletion(messageData, tenant, metadata);
-        return;
+      console.log('⚡ Non-order flow reached order handler. Redirecting to generic completion handler.', {
+        flowType: tokenRecord.flowType,
+        source: tokenRecord.contextData?.source || 'unknown'
+      });
+      await handleFlowCompletion(messageData, tenant, metadata);
+      return;
     }
 
     let orderAmount = 0;
     let orderItems = [];
 
-    if (rawFlowData.order_total) orderAmount = parseFloat(rawFlowData.order_total);
-    else if (tokenRecord && tokenRecord.contextData) {
-        orderAmount = parseFloat(tokenRecord.contextData.total || 0);
-        orderItems = tokenRecord.contextData.items || [];
+    if (rawFlowData.order_total) {
+      orderAmount = parseFloat(rawFlowData.order_total);
+    } else if (tokenRecord && tokenRecord.contextData) {
+      orderAmount = parseFloat(tokenRecord.contextData.total || 0);
+      orderItems = tokenRecord.contextData.items || [];
     } else if (tokenRecord && tokenRecord.orderData) {
-        orderAmount = parseFloat(tokenRecord.orderData.total || 0);
-        orderItems = tokenRecord.orderData.items || [];
+      orderAmount = parseFloat(tokenRecord.orderData.total || 0);
+      orderItems = tokenRecord.orderData.items || [];
     }
 
-    // 🛑🛑 CRITICAL FIX: STOP EMPTY ORDERS 🛑🛑
-    // If we have no items OR the total amount is 0, do NOT proceed.
+    orderItems = normalizeOrderItemsForStorage(orderItems);
+
+    // 🛑 STOP EMPTY ORDERS
     if (!orderItems || orderItems.length === 0 || orderAmount <= 0) {
-        console.warn(`⚠️ Blocked Empty/Invalid Order from ${messageData.from}. Amount: ${orderAmount}, Items: ${orderItems?.length}`);
-
-        const whatsappService = new WhatsAppService(tenant);
-        await whatsappService.sendMessage(messageData.from, "⚠️ We could not retrieve your cart items or the session has expired. Please add items to your cart again and retry.");
-        return; // STOP EXECUTION HERE
+      console.warn(`⚠️ Blocked Empty/Invalid Order from ${messageData.from}. Amount: ${orderAmount}, Items: ${orderItems?.length}`);
+      const whatsappService = new WhatsAppService(tenant);
+      await whatsappService.sendMessage(messageData.from, "⚠️ We could not retrieve your cart items or the session has expired. Please add items to your cart again and retry.");
+      return;
     }
-    // 🛑🛑 END FIX 🛑🛑
 
     // 3. Create & Save Order
     const Order = require('../models/Order');
-    const { generateOrderId } = require('../utils/orderUtils');
-
     const orderId = await generateOrderId(tenant._id.toString(), 'order');
 
     const newOrder = new Order({
-        tenantId: tenant._id.toString(),
-        orderId: orderId,
-        orderNumber: orderId,
-        customerPhone: messageData.from,
-        customerDetails: { name: flowData.name || 'Customer', email: flowData.email || "", phone: messageData.from },
-        shippingAddress: {
-            name: flowData.name || 'Customer',
-            addressLine1: flowData.address || flowData.address_1,
-            addressLine2: flowData.landmark || flowData.address_2 || "",
-            city: flowData.city,
-            state: flowData.state,
-            pincode: flowData.zip_code || flowData.pincode || flowData.postal_code,
-            country: 'India',
-            phone: messageData.from
-        },
-        orderAmount: orderAmount,
-        totalAmount: orderAmount,
-        currency: 'INR',
-        status: 'pending',
-        paymentStatus: 'pending',
-        source: 'whatsapp_flow',
-        flowToken: rawFlowData.flow_token,
-        items: orderItems
+      tenantId: tenant._id.toString(),
+      orderId: orderId,
+      orderNumber: orderId,
+      customerPhone: messageData.from,
+      customerDetails: { name: flowData.name || 'Customer', email: flowData.email || "", phone: messageData.from },
+      shippingAddress: {
+        name: flowData.name || 'Customer',
+        addressLine1: flowData.address || flowData.address_1,
+        addressLine2: flowData.landmark || flowData.address_2 || "",
+        city: flowData.city,
+        state: flowData.state,
+        pincode: flowData.zip_code || flowData.pincode || flowData.postal_code,
+        country: 'India',
+        phone: messageData.from
+      },
+      orderAmount: orderAmount,
+      totalAmount: orderAmount,
+      currency: 'INR',
+      status: 'pending',
+      paymentStatus: 'pending',
+      source: 'whatsapp_flow',
+      flowToken: rawFlowData.flow_token,
+      items: orderItems
     });
 
     await newOrder.save();
@@ -3226,173 +3679,154 @@ async function handleFlowCompletionWithShipping(messageData, tenant, metadata) {
 
     // 🛑 STOP ABANDONED CART TIMER
     try {
-        const abandonedCartService = require('../services/abandonedCartService');
-        abandonedCartService.cancelTimer(tenant._id.toString(), messageData.from);
-    } catch (e) { console.error('Error cancelling cart timer:', e); }
+      const abandonedCartService = require('../services/abandonedCartService');
+      abandonedCartService.cancelTimer(tenant._id.toString(), messageData.from);
+    } catch (e) {
+      console.error('Error cancelling cart timer:', e);
+    }
 
     const whatsappService = new WhatsAppService(tenant);
 
-	// 4. Shipping Logic
-	const isShippingEnabled = settings?.automationConfig?.shippingSelection?.enabled !== false;
-	// 'auto' = old behavior (default), 'customer_choice' = send list, wait for customer tap
-	const selectionMode = settings?.automationConfig?.shippingSelection?.selectionMode || 'auto';
+    // 4. Shipping Logic
+    const isShippingEnabled = settings?.automationConfig?.shippingSelection?.enabled !== false;
+    const selectionMode = settings?.automationConfig?.shippingSelection?.selectionMode || 'auto';
 
-	if (isShippingEnabled) {
-	    const ShippingMethod = require('../models/ShippingMethod');
-	    const activeMethodsCount = await ShippingMethod.countDocuments({
-	        tenantId: tenant._id.toString(), isActive: true
-	    });
+    if (isShippingEnabled) {
+      const ShippingMethod = require('../models/ShippingMethod');
+      const activeMethodsCount = await ShippingMethod.countDocuments({
+        tenantId: tenant._id.toString(),
+        isActive: true
+      });
 
-	    if (activeMethodsCount > 0) {
-	        const ShippingCalculation = require('../models/ShippingCalculation');
-	        const calculation = new ShippingCalculation({
-		    tenantId: tenant._id.toString(),
-		    customerPhone: messageData.from,
-		    orderDetails: {
-		        orderId: orderId,
-		        orderAmount: orderAmount,
-		        currency: 'INR',
-		        itemCount: newOrder.items.length || 1
-		    },
-		    customerAddress: {
-		        name: flowData.name,
-		        addressLine1: flowData.address,
-		        city: flowData.city,
-		        state: flowData.state,      // ← USE flowData DIRECTLY, not newOrder.shippingAddress
-		        pincode: flowData.zip_code,
-		        country: flowData.country || 'India'
-		    },
-		    flowToken: rawFlowData.flow_token,
-		    calculationStatus: 'pending'
-		});
-
-	        const options = await calculation.calculateShippingOptions();
-	        await calculation.save();
-
-	        // ─────────────────────────────────────────────────────
-	        // MODE: customer_choice — send list, wait for customer
-	        // ─────────────────────────────────────────────────────
-	        if (selectionMode === 'customer_choice') {
-	            const courierOptions = options.filter(o =>
-	                o.isEligible &&
-	                (o.courierType === 'courier' || o.courierType === 'slab')
-	            );
-
-	            if (courierOptions.length > 0) {
-	                console.log(`📋 customer_choice mode: sending ${courierOptions.length} courier options to ${messageData.from}`);
-
-	                // Send the WhatsApp list message
-	                await whatsappService.sendShippingOptionsList(messageData.from, {
-	                    orderAmount: orderAmount,
-	                    shippingOptions: options,
-	                    customerName: flowData.name || 'Customer',
-	                    freeShippingApplied: calculation.freeShippingApplied
-	                });
-
-	                // If free shipping also qualifies, send that info separately
-	                if (calculation.freeShippingApplied && calculation.freeShippingDetails) {
-	                    const freeTemplate = settings?.automationConfig?.shippingSelection?.freeShippingTemplate;
-	                    let freeMsg = freeTemplate?.body ||
-	                        '🎉 Your order also qualifies for FREE shipping via {{method}}!';
-	                    freeMsg = freeMsg.replace('{{method}}',
-	                        calculation.freeShippingDetails.methodName || 'free delivery');
-	                    await whatsappService.sendMessage(messageData.from, freeMsg);
-	                }
-
-	                // Stop here — payment link will be sent once customer taps a courier
-	                return;
-	            }
-
-	            // No selectable courier options (only free shipping) — fall through to auto
-	            console.log('⚠️ customer_choice: no courier options available, falling through to auto');
-	        }
-
-	        // ─────────────────────────────────────────────────────
-	        // MODE: auto — original behavior, unchanged
-	        // ─────────────────────────────────────────────────────
-	        const validOption = options.find(o => o.isEligible);
-
-	        if (validOption) {
-	            await calculation.selectShippingMethod(
-	                validOption.methodId, validOption.methodName, validOption.shippingCost
-	            );
-	            const totalWithShipping = orderAmount + validOption.shippingCost;
-
-	            await Order.findOneAndUpdate(
-	                { orderId: orderId, tenantId: tenant._id.toString() },
-	                {
-	                    $set: {
-	                        shippingCost: validOption.shippingCost,
-	                        totalAmount: totalWithShipping,
-	                        shippingMethod: {
-	                            name: validOption.methodName,
-	                            cost: validOption.shippingCost,
-	                            providerId: validOption.methodId
-	                        },
-	                        status: 'shipping_selected'
-	                    }
-	                }
-	            );
-
-	            let messageText = `🚚 *Shipping Calculated*\nMethod: ${validOption.methodName}\nTotal: ₹${totalWithShipping.toFixed(2)}`;
-	            if (validOption.isFreeShipping || validOption.shippingCost === 0) {
-	                messageText = `🎉 Free Shipping Applied!\nTotal: ₹${totalWithShipping.toFixed(2)}`;
-	            }
-	            await whatsappService.sendMessage(messageData.from, messageText);
-
-	            if (settings?.automationConfig?.paymentRequest?.enabled !== false) {
-	                await sendPaymentMessage(calculation, messageData, tenant, metadata);
-	            }
-	            return;
-	        }
-	    }
-	}
-
-    // 5. Fallback Logic (Direct Payment)
-    if (settings?.automationConfig?.paymentRequest?.enabled !== false && newOrder.totalAmount > 0) {
-    const gateway = settings?.automationConfig?.paymentRequest?.paymentGateway || 'razorpay';
-
-    if (gateway === 'stripe') {
-        console.log('💳 Fallback path: Stripe payment link');
-        await sendOrderStripePaymentLink(messageData.from, newOrder, settings, tenant, metadata);
-    } else {
-        console.log('💳 Fallback path: Razorpay UPI');
-        const paymentConfigurationName = settings?.automationConfig?.paymentRequest?.paymentConfigurationName;
-        const paymentPayload = {
-            reference_id: orderId,
-            type: 'physical-goods',
+      if (activeMethodsCount > 0) {
+        const ShippingCalculation = require('../models/ShippingCalculation');
+        const calculation = new ShippingCalculation({
+          tenantId: tenant._id.toString(),
+          customerPhone: messageData.from,
+          orderDetails: {
+            orderId: orderId,
+            orderAmount: orderAmount,
             currency: 'INR',
-            total_amount: {
-                value: Math.round(newOrder.totalAmount * 100),
-                offset: 100
-            },
-            payment_settings: [{
-                type: 'payment_gateway',
-                payment_gateway: {
-                    type: 'razorpay',
-                    configuration_name: paymentConfigurationName,
-                    razorpay: { receipt: orderId, notes: { type: "ecommerce", order_id: orderId } }
-                }
-            }],
-            order: {
-                status: 'pending',
-                items: [{
-                    name: `Order #${orderId}`,
-                    amount: { value: Math.round(newOrder.totalAmount * 100), offset: 100 },
-                    quantity: 1
-                }],
-                subtotal: { value: Math.round(newOrder.totalAmount * 100), offset: 100 }
+            itemCount: newOrder.items.length || 1
+          },
+          customerAddress: {
+            name: flowData.name,
+            addressLine1: flowData.address,
+            city: flowData.city,
+            state: flowData.state,
+            pincode: flowData.zip_code,
+            country: flowData.country || 'India'
+          },
+          flowToken: rawFlowData.flow_token,
+          calculationStatus: 'pending'
+        });
+
+        const options = await calculation.calculateShippingOptions();
+        await calculation.save();
+
+        if (selectionMode === 'customer_choice') {
+          const courierOptions = options.filter(o => o.isEligible && (o.courierType === 'courier' || o.courierType === 'slab'));
+
+          if (courierOptions.length > 0) {
+            console.log(`📋 customer_choice mode: sending options to ${messageData.from}`);
+            await whatsappService.sendShippingOptionsList(messageData.from, {
+              orderAmount: orderAmount,
+              shippingOptions: options,
+              customerName: flowData.name || 'Customer',
+              freeShippingApplied: calculation.freeShippingApplied
+            });
+
+            if (calculation.freeShippingApplied && calculation.freeShippingDetails) {
+              const freeTemplate = settings?.automationConfig?.shippingSelection?.freeShippingTemplate;
+              let freeMsg = freeTemplate?.body || '🎉 Your order also qualifies for FREE shipping via {{method}}!';
+              freeMsg = freeMsg.replace('{{method}}', calculation.freeShippingDetails.methodName || 'free delivery');
+              await whatsappService.sendMessage(messageData.from, freeMsg);
             }
-        };
-        await whatsappService.sendPaymentOrderDetails(
-            messageData.from,
-            paymentPayload,
-            settings?.automationConfig?.paymentRequest?.template
-        );
+            return;
+          }
+        }
+
+        // Auto Selection
+        const validOption = options.find(o => o.isEligible);
+        if (validOption) {
+          await calculation.selectShippingMethod(validOption.methodId, validOption.methodName, validOption.shippingCost);
+          const totalWithShipping = orderAmount + validOption.shippingCost;
+
+          await Order.findOneAndUpdate({
+            orderId: orderId,
+            tenantId: tenant._id.toString()
+          }, {
+            $set: {
+              shippingCost: validOption.shippingCost,
+              totalAmount: totalWithShipping,
+              shippingMethod: {
+                name: validOption.methodName,
+                cost: validOption.shippingCost,
+                providerId: validOption.methodId
+              },
+              status: 'shipping_selected'
+            }
+          });
+
+          let messageText = `🚚 *Shipping Calculated*\nMethod: ${validOption.methodName}\nTotal: ₹${totalWithShipping.toFixed(2)}`;
+          if (validOption.isFreeShipping || validOption.shippingCost === 0) {
+            messageText = `🎉 Free Shipping Applied!\nTotal: ₹${totalWithShipping.toFixed(2)}`;
+          }
+          await whatsappService.sendMessage(messageData.from, messageText);
+
+          if (settings?.automationConfig?.paymentRequest?.enabled !== false) {
+            await sendPaymentMessage(calculation, messageData, tenant, metadata);
+          }
+          return;
+        }
+      }
     }
-} else {
-    await whatsappService.sendMessage(messageData.from, `✅ Order Placed! ID: ${orderId}\nWe will contact you shortly.`);
-}
+
+    // 5. Fallback Payment Logic
+    if (settings?.automationConfig?.paymentRequest?.enabled !== false && newOrder.totalAmount > 0) {
+      const gateway = settings?.automationConfig?.paymentRequest?.paymentGateway || 'razorpay';
+
+      if (gateway === 'stripe') {
+        await sendOrderStripePaymentLink(messageData.from, newOrder, settings, tenant, metadata);
+      } else if (gateway === 'cashfree') {
+        await sendCashfreePayment(messageData, newOrder, newOrder.totalAmount, settings, tenant, metadata);
+      } else if (gateway === 'hitpay') {
+        await sendHitPayPayment(messageData, newOrder, newOrder.totalAmount, settings, tenant, metadata);
+      } else {
+        const paymentConfigurationName = settings?.automationConfig?.paymentRequest?.paymentConfigurationName;
+        // Razorpay logic normally goes here
+        const paymentPayload = {
+          reference_id: orderId,
+          type: 'physical-goods',
+          currency: 'INR',
+          total_amount: { value: Math.round(newOrder.totalAmount * 100), offset: 100 },
+          payment_settings: [{
+            type: 'payment_gateway',
+            payment_gateway: {
+              type: 'razorpay',
+              configuration_name: paymentConfigurationName,
+              razorpay: {
+                receipt: orderId,
+                notes: { order_id: orderId, tenant_id: tenant._id.toString() }
+              }
+            }
+          }],
+          order: {
+            status: 'pending',
+            items: [{ name: `Order ${orderId}`, amount: { value: Math.round(newOrder.totalAmount * 100), offset: 100 }, quantity: 1 }],
+            subtotal: { value: Math.round(newOrder.totalAmount * 100), offset: 100 }
+          }
+        };
+
+        await whatsappService.sendPaymentOrderDetails(
+          messageData.from,
+          paymentPayload,
+          settings?.automationConfig?.paymentRequest?.template
+        );
+      }
+    } else {
+      await whatsappService.sendMessage(messageData.from, `✅ Order Placed! ID: ${orderId}\nWe will contact you shortly.`);
+    }
 
   } catch (error) {
     console.error('❌ Order Handler Error:', error);
@@ -3682,11 +4116,11 @@ async function handleFlowCompletion(messageData, tenant, metadata) {
           flowResponseData
         );
 
-	if (usedTokenRecord) {
+        if (usedTokenRecord) {
           resolvedFlowType = usedTokenRecord.flowType === 'order_completion' ? 'order_completion' : 'generic';
           console.log('Flow token marked as used:', {
             token: flowResponseData.flow_token.substring(0, 8) + '...',
-	    phoneNumber: usedTokenRecord.phoneNumber,
+            phoneNumber: usedTokenRecord.phoneNumber,
             flowType: usedTokenRecord.flowType,
             source: usedTokenRecord.contextData?.source || 'unknown'
 
@@ -3699,7 +4133,7 @@ async function handleFlowCompletion(messageData, tenant, metadata) {
       }
     }
 
-    
+
 
     const isGenericTriggerCompletion = Boolean(
       usedTokenRecord && (
@@ -3731,7 +4165,7 @@ async function handleFlowCompletion(messageData, tenant, metadata) {
           hasStatusField: Boolean(flowResponseData.status),
           orderConfirmed: Boolean(flowResponseData.order_confirmed)
         });
-       
+
         const ackResponse = await whatsappService.sendMessage(messageData.from, acknowledgmentMessage);
 
         if (ackResponse) {
@@ -3807,37 +4241,37 @@ async function sendPaymentMessage(calculation, messageData, tenant, metadata) {
   try {
     const orderId = calculation.orderDetails.orderId;
     console.log('PAYMENT: Processing for order:', orderId);
- 
+
     const Settings = require('../models/settings');
     const settings = await Settings.findOne({ tenant_id: tenant._id.toString() });
     const paymentConfig = settings?.automationConfig?.paymentRequest;
- 
+
     if (paymentConfig?.enabled === false) {
       console.log('🔕 Payment Request disabled for tenant');
       return;
     }
- 
+
     // ── Determine gateway ──────────────────────────────────────
     const gateway = paymentConfig?.paymentGateway || 'razorpay';
     console.log(`💳 Gateway: ${gateway.toUpperCase()}`);
- 
+
     const Order = require('../models/Order');
     const order = await Order.findOne({ tenantId: tenant._id.toString(), orderId });
     if (!order) throw new Error('Order not found');
- 
+
     const totalAmount = calculation.selectedShipping?.totalCost || order.totalAmount;
- 
+
     // ── STRIPE ─────────────────────────────────────────────────
     if (gateway === 'stripe') {
       console.log('💳 Route: STRIPE (per-tenant config from settings)');
- 
+
       const stripeConfig = paymentConfig?.stripeConfig || {};
       const currency     = stripeConfig.currency || 'inr';
       const currencyUpper  = currency.toUpperCase();
       const currencySymbol = { SGD: 'S$', USD: '$', GBP: '£', EUR: '€', INR: '₹' }[currencyUpper] || currencyUpper;
- 
+
       const stripeService = require('../services/stripeService');
- 
+
       const paymentLink = await stripeService.createPaymentLink({
         amount: stripeService.toCents(totalAmount),
         currency: currency.toLowerCase(),
@@ -3855,7 +4289,7 @@ async function sendPaymentMessage(calculation, messageData, tenant, metadata) {
         ...(stripeConfig.successUrl && { successUrl: stripeConfig.successUrl }),
         ...(stripeConfig.cancelUrl  && { cancelUrl:  stripeConfig.cancelUrl  })
       });
- 
+
       const template = paymentConfig?.template || {};
       const headerText = (template.header || '💳 Complete Your Payment').substring(0, 60);
       const footerText  = (template.footer || 'Secure Payment via Stripe').substring(0, 60);
@@ -3864,10 +4298,10 @@ async function sendPaymentMessage(calculation, messageData, tenant, metadata) {
           .replace('{{amount}}',   `${currencySymbol}${totalAmount.toFixed(2)}`)
           .replace('{{order_id}}', order.orderId)
       ).substring(0, 900);
- 
+
       const axios = require('axios');
       const whatsappService = new WhatsAppService(tenant);
- 
+
       const messagePayload = {
         messaging_product: 'whatsapp',
         recipient_type: 'individual',
@@ -3884,13 +4318,13 @@ async function sendPaymentMessage(calculation, messageData, tenant, metadata) {
           }
         }
       };
- 
+
       const response = await axios.post(
         `${whatsappService.baseUrl}/${whatsappService.phoneNumberId}/messages`,
         messagePayload,
         { headers: { Authorization: `Bearer ${whatsappService.accessToken}`, 'Content-Type': 'application/json' } }
       );
- 
+
       if (response.data) {
         await Message.create({
           tenantId: tenant._id,
@@ -3902,13 +4336,13 @@ async function sendPaymentMessage(calculation, messageData, tenant, metadata) {
           orderId: order.orderId, paymentGateway: 'stripe',
           messageId: response.data?.messages?.[0]?.id
         });
- 
+
         await Contact.findOneAndUpdate(
           { tenantId: tenant._id.toString(), phone_number: messageData.from },
           { $set: { lastMessage: `Payment Link - Order #${order.orderId}`, timestamp: new Date() } },
           { upsert: true }
         );
- 
+
         if (global.io) {
           global.io.to(tenant._id.toString()).emit('message_sent', {
             ...((await Message.findOne({ orderId: order.orderId, isPaymentMessage: true }))?.toObject() || {}),
@@ -3923,24 +4357,31 @@ async function sendPaymentMessage(calculation, messageData, tenant, metadata) {
       }
       return;
     }
- 
+
     // ── CASHFREE ───────────────────────────────────────────────
     if (gateway === 'cashfree') {
       console.log('💳 Route: CASHFREE UPI (per-tenant config from settings)');
       await sendCashfreePayment(messageData, order, totalAmount, settings, tenant, metadata);
       return;
     }
- 
+
+    // ── HITPAY ─────────────────────────────────────────────────
+    if (gateway === 'hitpay') {
+      console.log('💳 Route: HITPAY (per-tenant config from settings)');
+      await sendHitPayPayment(messageData, order, totalAmount, settings, tenant, metadata);
+      return;
+    }
+
     // ── RAZORPAY (default) ─────────────────────────────────────
     const razorpayConfigName =
       paymentConfig?.paymentConfigurationName ||
       settings?.flowConfig?.paymentConfigurationName;
- 
+
     if (!razorpayConfigName) {
       console.log('❌ No Razorpay config name found in settings');
       return;
     }
- 
+
     const amountInPaise = Math.round(totalAmount * 100);
     const paymentOrderPayload = {
       reference_id: order.orderId,
@@ -3964,7 +4405,7 @@ async function sendPaymentMessage(calculation, messageData, tenant, metadata) {
         subtotal: { value: amountInPaise, offset: 100 }
       }
     };
- 
+
     const customMessage = {
       header: paymentConfig?.template?.header || '💳 Complete Your Payment',
       body: (paymentConfig?.template?.body || 'Please complete your payment.')
@@ -3972,10 +4413,10 @@ async function sendPaymentMessage(calculation, messageData, tenant, metadata) {
         .replace('{{order_id}}', order.orderId),
       footer: paymentConfig?.template?.footer || 'Powered by GoWhats!'
     };
- 
+
     const whatsappService = new WhatsAppService(tenant);
     const response = await whatsappService.sendPaymentOrderDetails(messageData.from, paymentOrderPayload, customMessage);
- 
+
     if (response) {
       console.log('✅ Razorpay payment link sent');
       const paymentMessage = new Message({
@@ -3991,13 +4432,13 @@ async function sendPaymentMessage(calculation, messageData, tenant, metadata) {
         orderData: { orderId: order.orderId, total: totalAmount.toString(), currency: 'INR', status: 'pending_payment' }
       });
       await paymentMessage.save();
- 
+
       await Contact.findOneAndUpdate(
         { tenantId: tenant._id.toString(), phone_number: messageData.from },
         { $set: { lastMessage: `Payment Link - Order #${order.orderId}`, timestamp: new Date() } },
         { upsert: true }
       );
- 
+
       if (global.io) {
         global.io.to(tenant._id.toString()).emit('message_sent', {
           ...paymentMessage.toObject(),
@@ -4009,7 +4450,7 @@ async function sendPaymentMessage(calculation, messageData, tenant, metadata) {
         });
       }
     }
- 
+
   } catch (error) {
     console.error('PAYMENT: Error sending payment link:', error.message);
     try {
@@ -4021,7 +4462,7 @@ async function sendPaymentMessage(calculation, messageData, tenant, metadata) {
     } catch (e) { /* ignore fallback error */ }
   }
 }
- 
+
 
 
   const handleInteractiveMessageResponse = async (messageData, tenant, metadata) => {
@@ -4144,10 +4585,25 @@ async function sendPaymentMessage(calculation, messageData, tenant, metadata) {
 
     switch (selectedWorkflow.workflow) {
       case 'Visit Website': {
-        const visitWebsiteMsg = botConfig.workflowMessages?.find(wm => wm.workflow === 'Visit Website');
-        responseMessageText = visitWebsiteMsg?.message || `Here is our website: https://srfoodproducts.com 🙏`;
-        break;
-      }
+	  const visitWebsiteMsg = botConfig.workflowMessages?.find(
+	    wm => wm.workflow === 'Visit Website'
+	  );
+
+	  // ✅ FIX: URL comes from DB config, not hardcoded
+	  const visitUrl = selectedWorkflow?.url || visitWebsiteMsg?.url || null;
+
+	  if (visitUrl) {
+	    // Send message + URL as plain text (works on all WhatsApp versions)
+	    const msgText = visitWebsiteMsg?.message || 'Click the link below to visit our website! 🙏';
+	    responseMessageText = `${msgText}\n\n🔗 ${visitUrl}`;
+	  } else {
+	    // No URL configured — send message with a reminder to configure it
+	    responseMessageText = visitWebsiteMsg?.message ||
+	      'Please visit our website! (URL not configured yet — ask admin to add it in settings)';
+	  }
+	  break;
+	}
+
       case 'Shop Our Collection': {
         const shopWorkflowMsg = botConfig.workflowMessages?.find(wm => wm.workflow === 'Shop Our Collection');
         const catalogConfig = {
@@ -4317,17 +4773,17 @@ router.post('/', attachTenant, async (req, res) => {
       }
     }
 
-	if (field === 'calls') {
-	  console.log('📞 Calls webhook received');
-	  try {
-	    const { handleCallsWebhook } = require('./callingWebhooks');
-	    await handleCallsWebhook(value, tenant);
-	    return res.sendStatus(200);
-	  } catch (error) {
-	    console.error('❌ Error processing calls webhook:', error);
-	    return res.sendStatus(200);
-	  }
-	}
+        if (field === 'calls') {
+          console.log('📞 Calls webhook received');
+          try {
+            const { handleCallsWebhook } = require('./callingWebhooks');
+            await handleCallsWebhook(value, tenant);
+            return res.sendStatus(200);
+          } catch (error) {
+            console.error('❌ Error processing calls webhook:', error);
+            return res.sendStatus(200);
+          }
+        }
 
     // ============================================
     // 2. Handle Status Updates (Blue Ticks)
@@ -4478,7 +4934,7 @@ router.post('/', attachTenant, async (req, res) => {
         return res.sendStatus(200);
       }
 
-	  const existingInboundMessage = messageData.id
+          const existingInboundMessage = messageData.id
         ? await Message.findOne({
             tenantId,
             messageId: messageData.id,
@@ -4490,7 +4946,7 @@ router.post('/', attachTenant, async (req, res) => {
         : null;
 
 
-	if (existingInboundMessage) {
+        if (existingInboundMessage) {
         console.log('⚠️ Duplicate inbound webhook skipped (already saved):', {
           tenantId,
           messageId: messageData.id,
@@ -4580,7 +5036,7 @@ const inboundMessageLockTimer = startInboundMessageProcessingLock(inboundMessage
                     // ➡️ CUSTOM FLOW TRIGGER
                     console.log('🔀 Routing to Generic Trigger Flow Completion');
                     await handleFlowCompletion(messageData, tenant, metadata);
- 
+
                 } else {
                     // ➡️ NO TOKEN FOUND - FALLBACK using response JSON fields
                     console.log('⚠️ No token found, using fallback detection...');
@@ -4682,7 +5138,7 @@ const inboundMessageLockTimer = startInboundMessageProcessingLock(inboundMessage
               return res.sendStatus(200);
             }
 
-	    const flowTrigger = await checkFlowTrigger(buttonText, tenant);
+            const flowTrigger = await checkFlowTrigger(buttonText, tenant);
             if (flowTrigger) {
               console.log('⚡ Flow Trigger from Button:', {
                 triggerId: flowTrigger._id,
@@ -5167,35 +5623,51 @@ async function handleRegistrationFlowCompletion(messageData, tenant, metadata, r
 
     if (isGlobalPaymentEnabled && isEventPaymentRequired && totalAmount > 0) {
 
-      console.log(`💳 Payment Required. Sending ${paymentGateway.toUpperCase()} link for ${participantCount} pax in ${currency}...`);
+  console.log(`💳 Payment Required. Sending ${paymentGateway.toUpperCase()} link for ${participantCount} pax in ${currency}...`);
 
-      if (paymentGateway === 'stripe') {
-        console.log('💳 Route: STRIPE Payment Link');
-        await sendStripePaymentLink(
-          messageData.from,
-          registrationData,
-          registrationConfig,
-          tenant,
-          metadata,
-          orderId,
-          totalAmount,
-          participantCount,
-          currency
-        );
+  if (paymentGateway === 'stripe') {
+    console.log('💳 Route: STRIPE Payment Link');
+    await sendStripePaymentLink(
+      messageData.from,
+      registrationData,
+      registrationConfig,
+      tenant,
+      metadata,
+      orderId,
+      totalAmount,
+      participantCount,
+      currency
+    );
 
-      } else {
-        console.log('💳 Route: RAZORPAY Native Flow');
-        await sendRegistrationPaymentFlow(
-          messageData.from,
-          registrationData,
-          registrationConfig,
-          tenant,
-          metadata,
-          orderId,
-          totalAmount,
-          participantCount
-        );
-      }
+  } else if (paymentGateway === 'hitpay') {
+    console.log('💳 Route: HITPAY registration payment');
+    await sendHitPayPayment(
+      { from: messageData.from },
+      {
+        orderId,
+        customerDetails: { name: registrationData.name, email: registrationData.email },
+        totalAmount,
+        customerPhone: messageData.from,
+      },
+      totalAmount,
+      globalSettings,
+      tenant,
+      metadata
+    );
+
+  } else {
+    console.log('💳 Route: RAZORPAY Native Flow');
+    await sendRegistrationPaymentFlow(
+      messageData.from,
+      registrationData,
+      registrationConfig,
+      tenant,
+      metadata,
+      orderId,
+      totalAmount,
+      participantCount
+    );
+  }
 
    } else {
       // ✅ FREE FLOW - Generate tickets immediately
@@ -5574,7 +6046,7 @@ async function sendRegistrationConfirmation(phoneNumber, paymentData, registrati
 
 async function generateAndSendTicketQR(ticket, tenant, phoneNumber, confirmationMessage, participantCount = 1, config = null) {
   try {
-    console.log(`🎟️ Generating Master QR for Order: ${ticket.orderId} (Count: ${participantCount})`    );
+    console.log(`🎟️ Generating Master QR for Order: ${ticket.orderId} (Count: ${participantCount})`      );
 
     // ✅ PAYLOAD: Includes 'cnt' (count) so scanner knows total pax
     const qrPayload = JSON.stringify({
@@ -5889,18 +6361,18 @@ async function sendOrderStripePaymentLink(phoneNumber, order, settings, tenant, 
     console.log('💳 ====== SENDING STRIPE ORDER PAYMENT LINK (per-tenant config) ======');
     const axios = require('axios');
     const whatsappService = new WhatsAppService(tenant);
- 
+
     const paymentConfig = settings?.automationConfig?.paymentRequest;
     const stripeConfig  = paymentConfig?.stripeConfig || {};
- 
+
     // Read all values from tenant settings
     const currency       = stripeConfig.currency || 'inr';
     const currencyUpper  = currency.toUpperCase();
     const currencySymbol = { SGD: 'S$', USD: '$', GBP: '£', EUR: '€', INR: '₹', AED: 'AED ', MYR: 'RM ' }[currencyUpper] || currencyUpper + ' ';
     const totalAmount    = order.totalAmount || order.orderAmount || 0;
- 
+
     console.log(`💳 Stripe config: currency=${currencyUpper}, amount=${totalAmount}, tenant=${tenant._id}`);
- 
+
     const paymentLink = await stripeService.createPaymentLink({
       amount:        stripeService.toCents(totalAmount),
       currency:      currency.toLowerCase(),
@@ -5919,7 +6391,7 @@ async function sendOrderStripePaymentLink(phoneNumber, order, settings, tenant, 
       ...(stripeConfig.successUrl ? { successUrl: stripeConfig.successUrl } : {}),
       ...(stripeConfig.cancelUrl  ? { cancelUrl:  stripeConfig.cancelUrl  } : {}),
     });
- 
+
     // Build message from tenant template
     const template   = paymentConfig?.template || {};
     const headerText = (template.header || '💳 Complete Your Payment').substring(0, 60);
@@ -5929,7 +6401,7 @@ async function sendOrderStripePaymentLink(phoneNumber, order, settings, tenant, 
         .replace('{{amount}}',   `${currencySymbol}${totalAmount.toFixed(2)}`)
         .replace('{{order_id}}', order.orderId)
     ).substring(0, 900);
- 
+
     const messagePayload = {
       messaging_product: 'whatsapp',
       recipient_type: 'individual',
@@ -5946,13 +6418,13 @@ async function sendOrderStripePaymentLink(phoneNumber, order, settings, tenant, 
         }
       }
     };
- 
+
     const response = await axios.post(
       `${whatsappService.baseUrl}/${whatsappService.phoneNumberId}/messages`,
       messagePayload,
       { headers: { Authorization: `Bearer ${whatsappService.accessToken}`, 'Content-Type': 'application/json' } }
     );
- 
+
     // Save message record
     await Message.create({
       tenantId:          tenant._id,
@@ -5967,13 +6439,13 @@ async function sendOrderStripePaymentLink(phoneNumber, order, settings, tenant, 
       paymentGateway:    'stripe',
       messageId:         response.data?.messages?.[0]?.id
     });
- 
+
     await Contact.findOneAndUpdate(
       { tenantId: tenant._id.toString(), phone_number: phoneNumber },
       { $set: { lastMessage: `Payment Link - Order #${order.orderId}`, timestamp: new Date() } },
       { upsert: true }
     );
- 
+
     if (global.io) {
       global.io.to(tenant._id.toString()).emit('payment_order_sent', {
         customerPhone: phoneNumber,
@@ -5984,10 +6456,10 @@ async function sendOrderStripePaymentLink(phoneNumber, order, settings, tenant, 
         tenantId:      tenant._id
       });
     }
- 
+
     console.log('✅ Stripe order payment link sent successfully');
     return response.data;
- 
+
   } catch (error) {
     console.error('❌ Error sending Stripe order payment link:', error.message);
     throw error;

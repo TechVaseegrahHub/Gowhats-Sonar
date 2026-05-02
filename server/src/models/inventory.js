@@ -14,6 +14,22 @@ const inventoryItemSchema = new mongoose.Schema({
     type: String,
     required: true,
   },
+  color: {
+    type: String,
+    default: ''
+  },
+  size: {
+    type: String,
+    default: ''
+  },
+  variant_group: {
+    type: String,
+    default: ''
+  },
+  variant_label: {
+    type: String,
+    default: ''
+  },
   description: {
     type: String,
     required: true,
@@ -87,7 +103,11 @@ const inventoryItemSchema = new mongoose.Schema({
     message: String,
     details: mongoose.Schema.Types.Mixed,
     attemptedAt: Date
-  }
+  },
+  isBillzzySynced: {
+    type: Boolean,
+    default: false // Default to false so existing products aren't locked
+  },
 }, {
   timestamps: true // ✅ Added timestamps
 });
